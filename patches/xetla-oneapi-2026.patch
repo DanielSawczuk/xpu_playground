@@ -1,0 +1,3017 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2f817bc..0d12b2c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -3,9 +3,6 @@ set(CMAKE_CXX_STANDARD 20)
+ 
+ project(XeTLA)
+ 
+-include(CTest)
+-enable_testing()
+-
+ list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/tools/cmake")
+ find_package(MKL REQUIRED)
+ 
+@@ -24,7 +21,19 @@ endif ()
+ 
+ add_compile_options(-fsycl -fp-model=precise -Wall -Wextra)
+ add_link_options(-fsycl -lmkl_intel_lp64 -lmkl_sequential -lmkl_core -lpthread -lm)
+-link_libraries(-lgtest -lgtest_main)
+ 
+-add_subdirectory(tests)
++include(CTest)
++if(BUILD_TESTING)
++    find_package(GTest QUIET)
++    if(GTest_FOUND)
++        enable_testing()
++        add_subdirectory(tests)
++    else()
++        message(WARNING
++            "GoogleTest was not found; tests will not be built. "
++            "Install GoogleTest or configure with -DBUILD_TESTING=OFF "
++            "to suppress this warning.")
++    endif()
++endif()
++
+ add_subdirectory(examples)
+diff --git a/examples/01_gemm_universal/gemm_universal.cpp b/examples/01_gemm_universal/gemm_universal.cpp
+index 966727b..7c3db22 100644
+--- a/examples/01_gemm_universal/gemm_universal.cpp
++++ b/examples/01_gemm_universal/gemm_universal.cpp
+@@ -13,7 +13,8 @@
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
+-#include "tests/utils/utils.hpp"
++#include "tests/utils/common.hpp"
++#include "tests/utils/profiling.hpp"
+ #include "xetla.hpp"
+ 
+ enum class kslicing_impl_t : uint8_t { none = 0, global = 1, local = 2 };
+@@ -133,7 +134,7 @@ void gemm_universal_run(uint32_t iter) {
+     typename gemm_op_t::arguments_t gemm_arg(matrix_m, matrix_k, matrix_n, A,
+             matrix_k, B, matrix_n, C, matrix_n, Acc, Cnt);
+ 
+-    cl::sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
++    sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
+     if (!gemm_op_t::can_implement(gemm_arg)) {
+         std::cout << "The arguments cannot be supported, aborting ... "
+                   << std::endl;
+@@ -142,7 +143,7 @@ void gemm_universal_run(uint32_t iter) {
+         free(C, context);
+         free(Acc, context);
+         free(Cnt, context);
+-        FAIL();
++        XETLA_FAIL();
+     }
+ 
+     uint32_t warmup = 10;
+@@ -170,7 +171,7 @@ void gemm_universal_run(uint32_t iter) {
+         }
+     }
+ 
+-    ASSERT_EQ(0,
++    XETLA_ASSERT_EQ(0,
+             gemm_result_validate(A, B, C, 1, matrix_m, matrix_k, matrix_n,
+                     queue, mem_layout::row_major, mem_layout::row_major));
+ 
+diff --git a/examples/02_basic_gemm/basic_gemm.cpp b/examples/02_basic_gemm/basic_gemm.cpp
+index 1bc808b..4676074 100644
+--- a/examples/02_basic_gemm/basic_gemm.cpp
++++ b/examples/02_basic_gemm/basic_gemm.cpp
+@@ -13,7 +13,8 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  *******************************************************************************/
+-#include "tests/utils/utils.hpp"
++#include "tests/utils/common.hpp"
++#include "tests/utils/profiling.hpp"
+ #include "xetla.hpp"
+ 
+ void basic_gemm_run(uint32_t iter) {
+@@ -72,10 +73,19 @@ void basic_gemm_run(uint32_t iter) {
+     constexpr uint32_t sg_tile_m = 32;
+     constexpr uint32_t sg_tile_n = 64;
+ 
+-    // Workload mapping, linear mapping will be used in the code
++    // Dispatch workgroups in snake order.
++    static constexpr uint32_t wg_num_n = 8;
++    using group_swizzle = gpu::xetla::kernel::group_swizzle_snake<wg_num_n,
++            gpu_arch::Xe>;
++    using dispatch_policy
++            = gpu::xetla::kernel::dispatch_policy_default<group_swizzle>;
++
++    // Workload mapping
+     // Suppose it is divisible.
+     uint32_t group_range_m = matrix_m / wg_tile_m;
+     uint32_t group_range_n = matrix_n / wg_tile_n;
++    dispatch_policy::group_swizzle_policy::update_group_range(
++            group_range_m, group_range_n);
+ 
+     // Each subgroup will be executed in one hardware thread
+     // Calculate how many threads in a workgroup
+@@ -88,10 +98,10 @@ void basic_gemm_run(uint32_t iter) {
+     uint32_t ldc = matrix_n;
+ 
+     // Ndrange and workgroup shape
+-    cl::sycl::range<3> group_range {1, group_range_m, group_range_n};
+-    cl::sycl::range<3> local_range {1, thread_range_m, thread_range_n};
++    sycl::range<3> group_range {1, group_range_m, group_range_n};
++    sycl::range<3> local_range {1, thread_range_m, thread_range_n};
+ 
+-    cl::sycl::nd_range<3> nd_range(group_range * local_range, local_range);
++    sycl::nd_range<3> nd_range(group_range * local_range, local_range);
+ 
+     constexpr uint32_t warmup = 10;
+     long ops = 2 * static_cast<long>(matrix_m) * matrix_n * matrix_k;
+@@ -109,8 +119,8 @@ void basic_gemm_run(uint32_t iter) {
+                 // wrap the nd_range to XeTLA range
+ 
+                 // Performance tuning setting based on different shapes
+-                static constexpr uint32_t periodic_sync_interval = 8;
+-                static constexpr uint32_t prefetch_distance = 3;
++                static constexpr uint32_t periodic_sync_interval = 4;
++                static constexpr uint32_t prefetch_distance = 4;
+                 // should larger than 8
+                 static constexpr uint32_t k_stride = 32;
+ 
+@@ -165,8 +175,12 @@ void basic_gemm_run(uint32_t iter) {
+                 xetla_local_init<slm_size>();
+ 
+                 // Step 4: ecah workgroup gets it individual index to start computation
+-                int start_n = item.get_group(2) * wg_tile_n;
+-                int start_m = item.get_group(1) * wg_tile_m;
++                using group_swizzle_t
++                        = typename dispatch_policy::group_swizzle_policy;
++                int start_n = group_swizzle_t::template get_tile_idx<2>(item)
++                        * wg_tile_n;
++                int start_m = group_swizzle_t::template get_tile_idx<1>(item)
++                        * wg_tile_m;
+                 // no slicing in K direction so start from zero for all WG
+                 int start_k = 0;
+ 
+@@ -211,7 +225,7 @@ void basic_gemm_run(uint32_t iter) {
+         }
+     }
+ 
+-    ASSERT_EQ(0,
++    XETLA_ASSERT_EQ(0,
+             gemm_result_validate(A, B, C, 1, matrix_m, matrix_k, matrix_n,
+                     queue, mem_layout::row_major, mem_layout::row_major));
+ 
+@@ -226,6 +240,6 @@ void basic_gemm_run(uint32_t iter) {
+ int main() {
+     // This case shows how to use batch-reduce (br) GEMM microkernel to
+     // solve a standard GEMM
+-    basic_gemm_run(10);
++    basic_gemm_run(1000);
+     return (0);
+ }
+diff --git a/examples/03_gemm_relu_bias/gemm_relu_bias.cpp b/examples/03_gemm_relu_bias/gemm_relu_bias.cpp
+index 629657a..1d69d51 100644
+--- a/examples/03_gemm_relu_bias/gemm_relu_bias.cpp
++++ b/examples/03_gemm_relu_bias/gemm_relu_bias.cpp
+@@ -14,10 +14,11 @@
+ * limitations under the License.
+ *******************************************************************************/
+ #include <algorithm>
+-#include "tests/utils/utils.hpp"
++#include "tests/utils/common.hpp"
++#include "tests/utils/profiling.hpp"
+ #include "xetla.hpp"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ using namespace gpu::xetla;
+ using namespace gpu;
+ 
+@@ -171,11 +172,11 @@ void gemm_relu_bias_run(uint32_t iter) {
+     // [ReLuBias] assign epilogue_args to gemm_op_t::arguments_t
+     typename gemm_op_t::arguments_t arg(matrix_m, matrix_k, matrix_n, A,
+             matrix_k, B, matrix_n, C, matrix_n, epilogue_args);
+-    cl::sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(arg);
++    sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(arg);
+     if (!gemm_op_t::can_implement(arg)) {
+         std::cout << "The arguments cannot be supported, aborting ... "
+                   << std::endl;
+-        FAIL();
++        XETLA_FAIL();
+     }
+ 
+     constexpr uint32_t warmup = 10;
+@@ -201,7 +202,7 @@ void gemm_relu_bias_run(uint32_t iter) {
+         }
+     }
+ 
+-    ASSERT_EQ(0,
++    XETLA_ASSERT_EQ(0,
+             gemm_relu_bias_result_validate(A, B, C, D, matrix_m, matrix_k,
+                     matrix_n, queue, mem_layout::row_major,
+                     mem_layout::row_major));
+diff --git a/examples/04_gemm_polynomial/gemm_polynomial.cpp b/examples/04_gemm_polynomial/gemm_polynomial.cpp
+index 7ec971f..c73b5d5 100644
+--- a/examples/04_gemm_polynomial/gemm_polynomial.cpp
++++ b/examples/04_gemm_polynomial/gemm_polynomial.cpp
+@@ -14,12 +14,13 @@
+  * limitations under the License.
+  *******************************************************************************/
+ #include <algorithm>
+-#include "tests/utils/utils.hpp"
++#include "tests/utils/common.hpp"
++#include "tests/utils/profiling.hpp"
+ #include "xetla.hpp"
+ 
+ #include "gemm_polynomial.hpp"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ using namespace gpu::xetla;
+ 
+ template <typename data_type_a, typename data_type_b, typename data_type_c,
+@@ -179,7 +180,7 @@ void gemm_polynomial_run(int iter) {
+     typename gemm_op_t::arguments_t gemm_arg(matrix_m, matrix_k, matrix_n, A,
+             matrix_k, B, matrix_n, C, matrix_n, {epilogue_args});
+ 
+-    cl::sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
++    sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
+ 
+     if (!gemm_op_t::can_implement(gemm_arg)) {
+         std::cout << "The arguments cannot be supported, aborting ... "
+@@ -187,7 +188,7 @@ void gemm_polynomial_run(int iter) {
+         free(A, context);
+         free(B, context);
+         free(C, context);
+-        FAIL();
++        XETLA_FAIL();
+     }
+ 
+     uint32_t warmup = 10;
+@@ -212,7 +213,7 @@ void gemm_polynomial_run(int iter) {
+         }
+     }
+ 
+-    ASSERT_EQ(0,
++    XETLA_ASSERT_EQ(0,
+             gemm_polynomial_result_validate(A, B, C, matrix_m, matrix_k,
+                     matrix_n, queue, mem_layout::row_major,
+                     mem_layout::row_major));
+diff --git a/examples/05_batch_gemm/batch_gemm.cpp b/examples/05_batch_gemm/batch_gemm.cpp
+index 6711b79..2b5bb22 100644
+--- a/examples/05_batch_gemm/batch_gemm.cpp
++++ b/examples/05_batch_gemm/batch_gemm.cpp
+@@ -13,7 +13,8 @@
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
+-#include "tests/utils/utils.hpp"
++#include "tests/utils/common.hpp"
++#include "tests/utils/profiling.hpp"
+ 
+ #include "batch_gemm.hpp"
+ 
+@@ -129,14 +130,14 @@ void batch_gemm_run(uint32_t iter) {
+     typename batch_gemm_op_t::arguments_t gemm_arg(batch_size, matrix_m,
+             matrix_k, matrix_n, A, matrix_k, B, matrix_n, C, matrix_n);
+ 
+-    cl::sycl::nd_range<3> nd_range = batch_gemm_op_t::get_nd_range(gemm_arg);
++    sycl::nd_range<3> nd_range = batch_gemm_op_t::get_nd_range(gemm_arg);
+     if (!batch_gemm_op_t::can_implement(gemm_arg)) {
+         std::cout << "The arguments cannot be supported, aborting ... "
+                   << std::endl;
+         free(A, context);
+         free(B, context);
+         free(C, context);
+-        FAIL();
++        XETLA_FAIL();
+     }
+ 
+     uint32_t warmup = 10;
+@@ -162,7 +163,7 @@ void batch_gemm_run(uint32_t iter) {
+         }
+     }
+ 
+-    ASSERT_EQ(0,
++    XETLA_ASSERT_EQ(0,
+             gemm_result_validate(A, B, C, batch_size, matrix_m, matrix_k,
+                     matrix_n, queue, mem_layout::row_major,
+                     mem_layout::row_major));
+diff --git a/examples/05_batch_gemm/batch_gemm.hpp b/examples/05_batch_gemm/batch_gemm.hpp
+index ce2a814..c2400cc 100644
+--- a/examples/05_batch_gemm/batch_gemm.hpp
++++ b/examples/05_batch_gemm/batch_gemm.hpp
+@@ -180,36 +180,36 @@ public:
+ 
+     /// @brief Host helper function to get the expected local range under the current BATCH_GEMM config.
+     /// @return Expected local range.
+-    static cl::sycl::range<3> get_local_range() {
++    static sycl::range<3> get_local_range() {
+         uint32_t local_range_m = (wg_tile_m + sg_tile_m - 1) / sg_tile_m;
+         uint32_t local_range_n = (wg_tile_n + sg_tile_n - 1) / sg_tile_n;
+         std::cout << "Local range: {" << 1 << ", " << local_range_m << ", "
+                   << local_range_n << "} \n";
+         assert(local_range_m * local_range_n <= 32);
+-        return cl::sycl::range<3> {1, local_range_m, local_range_n};
++        return sycl::range<3> {1, local_range_m, local_range_n};
+     };
+ 
+     /// @brief Host helper function to get the expected group range under the current BATCH_GEMM config.
+     /// @param matrix_m Is the size of the m dimension of the matrix multiplication (m x k x n).
+     /// @param matrix_n Is the size of the n dimension of the matrix multiplication (m x k x n).
+     /// @return Expected group range.
+-    static cl::sycl::range<3> get_group_range(
++    static sycl::range<3> get_group_range(
+             uint32_t batch_size, uint32_t matrix_m, uint32_t matrix_n) {
+         uint32_t group_range_m = (matrix_m + wg_tile_m - 1) / wg_tile_m;
+         uint32_t group_range_n = (matrix_n + wg_tile_n - 1) / wg_tile_n;
+         std::cout << "Group range: {" << batch_size << ", " << group_range_m
+                   << ", " << group_range_n << "} \n";
+-        return cl::sycl::range<3> {batch_size, group_range_m, group_range_n};
++        return sycl::range<3> {batch_size, group_range_m, group_range_n};
+     };
+ 
+     /// @brief Host helper function to get the expected nd_range under the current BATCH_GEMM config.
+     /// @param args Is the BATCH_GEMM arguments for application-related runtime variables.
+     /// @return Expected nd_range.
+-    static cl::sycl::nd_range<3> get_nd_range(arguments_t &args) {
+-        cl::sycl::range<3> local_range = get_local_range();
+-        cl::sycl::range<3> group_range = get_group_range(
++    static sycl::nd_range<3> get_nd_range(arguments_t &args) {
++        sycl::range<3> local_range = get_local_range();
++        sycl::range<3> group_range = get_group_range(
+                 args.batch_size, args.matrix_m, args.matrix_n);
+-        return cl::sycl::nd_range<3> {group_range * local_range, local_range};
++        return sycl::nd_range<3> {group_range * local_range, local_range};
+     };
+ 
+     /// @brief Check if the arguments can be implemented.
+diff --git a/examples/06_gemm_softmax/gemm_softmax.cpp b/examples/06_gemm_softmax/gemm_softmax.cpp
+index 301aed2..d177c13 100644
+--- a/examples/06_gemm_softmax/gemm_softmax.cpp
++++ b/examples/06_gemm_softmax/gemm_softmax.cpp
+@@ -14,11 +14,12 @@
+  * limitations under the License.
+  *******************************************************************************/
+ 
+-#include "tests/utils/utils.hpp"
++#include "tests/utils/common.hpp"
++#include "tests/utils/profiling.hpp"
+ #include "xetla.hpp"
+ 
+ using namespace gpu::xetla;
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ #define SIMD 32
+ 
+@@ -151,9 +152,9 @@ void gemm_softmax_run(uint32_t iter) {
+               << ", group_num_z: " << batch_num << "\n";
+     std::cout << "group_size_x: " << subgroup_range_n
+               << ", group_size_y: " << subgroup_range_m << std::endl;
+-    cl::sycl::range<3> group_range {batch_num, group_range_m, group_range_n};
+-    cl::sycl::range<3> local_range {1, subgroup_range_m, subgroup_range_n};
+-    cl::sycl::nd_range<3> nd_range(group_range * local_range, local_range);
++    sycl::range<3> group_range {batch_num, group_range_m, group_range_n};
++    sycl::range<3> local_range {1, subgroup_range_m, subgroup_range_n};
++    sycl::nd_range<3> nd_range(group_range * local_range, local_range);
+ 
+     uint32_t warmup = 10;
+     long ops
+@@ -303,12 +304,12 @@ void gemm_softmax_run(uint32_t iter) {
+                 prof.add_gpu_event(gpu_event);
+             }
+         }
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+-        FAIL();
++        XETLA_FAIL();
+     }
+ 
+-    ASSERT_EQ(0,
++    XETLA_ASSERT_EQ(0,
+             gemm_softmax_result_validate(A, B, C, matrix_m, matrix_k, matrix_n,
+                     batch_num, queue, mem_layout::row_major,
+                     mem_layout::col_major));
+diff --git a/examples/07_multi_layer_perceptron/multi_layer_perceptron.cpp b/examples/07_multi_layer_perceptron/multi_layer_perceptron.cpp
+index e0fab34..1127e96 100644
+--- a/examples/07_multi_layer_perceptron/multi_layer_perceptron.cpp
++++ b/examples/07_multi_layer_perceptron/multi_layer_perceptron.cpp
+@@ -15,9 +15,10 @@
+ *******************************************************************************/
+ #include <algorithm>
+ #include "multi_layer_perceptron.hpp"
+-#include "tests/utils/utils.hpp"
++#include "tests/utils/common.hpp"
++#include "tests/utils/profiling.hpp"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ using namespace gpu::xetla;
+ 
+ // MLP input size
+@@ -243,7 +244,7 @@ void mlp_run(uint32_t iter) {
+     typename mlp_op_t::arguments_t mlp_arg(matrix_m, matrix_k, matrix_n,
+             matrix_m, matrix_n, matrix_l, A, matrix_k, W, matrix_n, B, matrix_n,
+             V, matrix_l, C, matrix_l);
+-    cl::sycl::nd_range<3> nd_range = mlp_op_t::get_nd_range(mlp_arg);
++    sycl::nd_range<3> nd_range = mlp_op_t::get_nd_range(mlp_arg);
+ 
+     if (!mlp_op_t::can_implement(mlp_arg)) {
+         std::cout << "The arguments cannot be supported, aborting ... "
+@@ -253,7 +254,7 @@ void mlp_run(uint32_t iter) {
+         free(C, context);
+         free(W, context);
+         free(V, context);
+-        FAIL();
++        XETLA_FAIL();
+     }
+     uint32_t warmup = 10;
+     long ops = 2 * static_cast<long>(matrix_m) * matrix_n * matrix_k
+@@ -278,7 +279,7 @@ void mlp_run(uint32_t iter) {
+         }
+     }
+ 
+-    ASSERT_EQ(0,
++    XETLA_ASSERT_EQ(0,
+             mlp_result_validate(A, B, C, W, V, matrix_m, matrix_k, matrix_n,
+                     matrix_l, queue, mem_layout::row_major,
+                     mem_layout::row_major, mem_layout::row_major));
+diff --git a/examples/07_multi_layer_perceptron/multi_layer_perceptron.hpp b/examples/07_multi_layer_perceptron/multi_layer_perceptron.hpp
+index 7dc37ab..ec39123 100644
+--- a/examples/07_multi_layer_perceptron/multi_layer_perceptron.hpp
++++ b/examples/07_multi_layer_perceptron/multi_layer_perceptron.hpp
+@@ -284,7 +284,7 @@ public:
+ 
+     /// @brief Host helper function to get the expected local range under the current MLP config.
+     /// @return Expected local range.
+-    static cl::sycl::range<3> get_local_range() {
++    static sycl::range<3> get_local_range() {
+         // make sure first layer and second layer use same subgroup number.
+         static_assert(work_group_layer1_t::size == work_group_layer2_t::size,
+                 "we should make sure first gemm and second gemm use same "
+@@ -296,14 +296,14 @@ public:
+         std::cout << "Local range: {" << 1 << ", " << local_range_m << ", "
+                   << local_range_n << "} \n";
+         assert(local_range_m * local_range_n <= 32);
+-        return cl::sycl::range<3> {1, local_range_m, local_range_n};
++        return sycl::range<3> {1, local_range_m, local_range_n};
+     };
+ 
+     /// @brief Host helper function to get the expected group range under the current MLP config.
+     /// @param matrix_m Is the size of the m dimension of the matrix multiplication (m x k x n).
+     /// @param matrix_n Is the size of the n dimension of the matrix multiplication (m x k x n).
+     /// @return Expected group range.
+-    static cl::sycl::range<3> get_group_range(arguments_t &args) {
++    static sycl::range<3> get_group_range(arguments_t &args) {
+         // make sure first layer and second layer meet the condition to be fused.
+         static_assert(wg_tile_m_layer1 == wg_tile_m_layer2,
+                 "first gemm and second gemm should have the same wg_tile_m");
+@@ -320,16 +320,16 @@ public:
+                 / wg_tile_n_layer1;
+         std::cout << "Group range: {1"
+                   << ", " << group_range_m << ", " << group_range_n << "} \n";
+-        return cl::sycl::range<3> {1, group_range_m, group_range_n};
++        return sycl::range<3> {1, group_range_m, group_range_n};
+     };
+ 
+     /// @brief Host helper function to get the expected nd_range under the current MLP config.
+     /// @param args Is the MLP arguments for application-related runtime variables.
+     /// @return Expected nd_range.
+-    static cl::sycl::nd_range<3> get_nd_range(arguments_t &args) {
+-        cl::sycl::range<3> local_range = get_local_range();
+-        cl::sycl::range<3> group_range = get_group_range(args);
+-        return cl::sycl::nd_range<3> {group_range * local_range, local_range};
++    static sycl::nd_range<3> get_nd_range(arguments_t &args) {
++        sycl::range<3> local_range = get_local_range();
++        sycl::range<3> group_range = get_group_range(args);
++        return sycl::nd_range<3> {group_range * local_range, local_range};
+     };
+ 
+     /// @brief Check if the arguments can be implemented.
+diff --git a/examples/08_scaled_dot_product_attention/scaled_dot_product_attention.cpp b/examples/08_scaled_dot_product_attention/scaled_dot_product_attention.cpp
+index 9abea95..d499d0b 100644
+--- a/examples/08_scaled_dot_product_attention/scaled_dot_product_attention.cpp
++++ b/examples/08_scaled_dot_product_attention/scaled_dot_product_attention.cpp
+@@ -15,10 +15,11 @@
+  *******************************************************************************/
+ 
+ #include "softmax.hpp"
+-#include "tests/utils/utils.hpp"
++#include "tests/utils/common.hpp"
++#include "tests/utils/profiling.hpp"
+ 
+ using namespace gpu::xetla;
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ #define SIMD 32
+ 
+@@ -227,9 +228,9 @@ void sdp_fwd_run(uint32_t iter) {
+               << ", group_num_z: " << batch_cnt << "\n";
+     std::cout << "group_size_x: " << subgroup_range_n
+               << ", group_size_y: " << subgroup_range_m << std::endl;
+-    cl::sycl::range<3> group_range {batch_cnt, group_range_m, group_range_n};
+-    cl::sycl::range<3> local_range {1, subgroup_range_m, subgroup_range_n};
+-    cl::sycl::nd_range<3> nd_range(group_range * local_range, local_range);
++    sycl::range<3> group_range {batch_cnt, group_range_m, group_range_n};
++    sycl::range<3> local_range {1, subgroup_range_m, subgroup_range_n};
++    sycl::nd_range<3> nd_range(group_range * local_range, local_range);
+ 
+     constexpr uint32_t warmup = 10;
+     long ops = long(4 * batch_num * head_num * sequence_len) * sequence_len
+@@ -476,12 +477,12 @@ void sdp_fwd_run(uint32_t iter) {
+                 prof.add_gpu_event(gpu_event);
+             }
+         }
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+-        FAIL();
++        XETLA_FAIL();
+     }
+ 
+-    ASSERT_EQ(0,
++    XETLA_ASSERT_EQ(0,
+             sdp_fwd_result_validate(q, k, v, attn_mask, out, matrix_m_qk,
+                     matrix_k_qk, matrix_n_qk, matrix_m_sv, matrix_k_sv,
+                     matrix_n_sv, batch_cnt, queue, mem_layout::row_major,
+diff --git a/examples/09_gate_recurrent_unit/gate_recurrent_unit.cpp b/examples/09_gate_recurrent_unit/gate_recurrent_unit.cpp
+index bebb161..6d83a5e 100644
+--- a/examples/09_gate_recurrent_unit/gate_recurrent_unit.cpp
++++ b/examples/09_gate_recurrent_unit/gate_recurrent_unit.cpp
+@@ -14,9 +14,10 @@
+  * limitations under the License.
+  *******************************************************************************/
+ #include "kernel_func.hpp"
+-#include "tests/utils/utils.hpp"
++#include "tests/utils/common.hpp"
++#include "tests/utils/profiling.hpp"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ using namespace gpu::xetla;
+ 
+ template <typename data_type>
+@@ -342,10 +343,10 @@ void gru_run(uint32_t iter) {
+ 
+     //***********dpcpp runtime setup && buffer allocation start ************//
+ 
+-    cl::sycl::range<3> group_range {1, (N + wg_tile_m - 1) / wg_tile_m, 1};
+-    cl::sycl::range<3> local_range {1, (wg_tile_m + sg_tile_m - 1) / sg_tile_m,
++    sycl::range<3> group_range {1, (N + wg_tile_m - 1) / wg_tile_m, 1};
++    sycl::range<3> local_range {1, (wg_tile_m + sg_tile_m - 1) / sg_tile_m,
+             (wg_tile_n + sg_tile_n - 1) / sg_tile_n};
+-    cl::sycl::nd_range<3> nd_range(group_range * local_range, local_range);
++    sycl::nd_range<3> nd_range(group_range * local_range, local_range);
+ 
+     std::cout << "Launch kernel:\n";
+     std::cout << "group_num_x: " << 1
+@@ -387,7 +388,7 @@ void gru_run(uint32_t iter) {
+         }
+     }
+ 
+-    ASSERT_EQ(0,
++    XETLA_ASSERT_EQ(0,
+             validation<data_type>(layer_inputs, h0_inputs, i_weights, h_weights,
+                     hidden_outputs, layer_outputs, N, F, H, L, queue, S));
+ 
+diff --git a/examples/10_gemm_large_n/gemm_large_n.cpp b/examples/10_gemm_large_n/gemm_large_n.cpp
+index 9a69e0c..cc714bb 100644
+--- a/examples/10_gemm_large_n/gemm_large_n.cpp
++++ b/examples/10_gemm_large_n/gemm_large_n.cpp
+@@ -13,7 +13,8 @@
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
+-#include "tests/utils/utils.hpp"
++#include "tests/utils/common.hpp"
++#include "tests/utils/profiling.hpp"
+ #include "xetla.hpp"
+ 
+ void gemm_large_n_run(uint32_t iter) {
+@@ -111,14 +112,14 @@ void gemm_large_n_run(uint32_t iter) {
+     typename gemm_op_t::arguments_t gemm_arg(matrix_m, matrix_k, matrix_n, A,
+             matrix_k, B, matrix_n, C, matrix_n);
+ 
+-    cl::sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
++    sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
+     if (!gemm_op_t::can_implement(gemm_arg)) {
+         std::cout << "The arguments cannot be supported, aborting ... "
+                   << std::endl;
+         free(A, queue);
+         free(B, queue);
+         free(C, queue);
+-        FAIL();
++        XETLA_FAIL();
+     }
+ 
+     uint32_t warmup = 10;
+@@ -147,7 +148,7 @@ void gemm_large_n_run(uint32_t iter) {
+ 
+     prof.print_profiling_result(profiling_selector::GPU);
+ 
+-    ASSERT_EQ(0,
++    XETLA_ASSERT_EQ(0,
+             gemm_result_validate(A, B, C, 1, matrix_m, matrix_k, matrix_n,
+                     queue, mem_layout::row_major, mem_layout::row_major));
+ 
+diff --git a/examples/11_stream_k_gemm/stream_k_gemm.cpp b/examples/11_stream_k_gemm/stream_k_gemm.cpp
+index eb21eeb..41b84bc 100644
+--- a/examples/11_stream_k_gemm/stream_k_gemm.cpp
++++ b/examples/11_stream_k_gemm/stream_k_gemm.cpp
+@@ -13,7 +13,8 @@
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
+-#include "tests/utils/utils.hpp"
++#include "tests/utils/common.hpp"
++#include "tests/utils/profiling.hpp"
+ #include "xetla.hpp"
+ 
+ void stream_k_gemm_run(uint32_t iter) {
+@@ -140,7 +141,7 @@ void stream_k_gemm_run(uint32_t iter) {
+             matrix_k, B, matrix_n, C, matrix_n, Acc, matrix_n, Cnt, size_cnt,
+             stream_k);
+ 
+-    cl::sycl::nd_range<3> NDRange = gemm_op_t::get_nd_range(gemm_arg);
++    sycl::nd_range<3> NDRange = gemm_op_t::get_nd_range(gemm_arg);
+ 
+     if (!gemm_op_t::can_implement(gemm_arg)) {
+         std::cout << "The arguments cannot be supported, aborting ... "
+@@ -150,7 +151,7 @@ void stream_k_gemm_run(uint32_t iter) {
+         free(C, queue);
+         free(Acc, queue);
+         free(Cnt, queue);
+-        FAIL();
++        XETLA_FAIL();
+     }
+ 
+     uint32_t warmup = 5;
+@@ -175,7 +176,7 @@ void stream_k_gemm_run(uint32_t iter) {
+         }
+     }
+ 
+-    ASSERT_EQ(0,
++    XETLA_ASSERT_EQ(0,
+             gemm_result_validate(A, B, C, 1, matrix_m, matrix_k, matrix_n,
+                     queue, mem_layout::row_major, mem_layout::row_major));
+ 
+@@ -382,12 +383,12 @@ void stream_k_gemm_relu_biasadd_run(uint32_t iter) {
+             matrix_k, B, matrix_n, C, matrix_n, Acc, matrix_n, Cnt, size_cnt,
+             stream_k, epilogue_args);
+ 
+-    cl::sycl::nd_range<3> NDRange = gemm_op_t::get_nd_range(gemm_arg);
++    sycl::nd_range<3> NDRange = gemm_op_t::get_nd_range(gemm_arg);
+ 
+     if (!gemm_op_t::can_implement(gemm_arg)) {
+         std::cout << "The arguments cannot be supported, aborting ... "
+                   << std::endl;
+-        FAIL();
++        XETLA_FAIL();
+     }
+ 
+     uint32_t warmup = 5;
+@@ -413,7 +414,7 @@ void stream_k_gemm_relu_biasadd_run(uint32_t iter) {
+         }
+     }
+ 
+-    ASSERT_EQ(0,
++    XETLA_ASSERT_EQ(0,
+             gemm_relu_bias_result_validate(A, B, C, Bias, matrix_m, matrix_k,
+                     matrix_n, queue, mem_layout::row_major,
+                     mem_layout::row_major));
+diff --git a/include/common/core/common.hpp b/include/common/core/common.hpp
+index 32159c2..bbfb9d1 100644
+--- a/include/common/core/common.hpp
++++ b/include/common/core/common.hpp
+@@ -19,9 +19,9 @@
+ 
+ #pragma once
+ 
+-#include <version.hpp>
+-#include <CL/sycl.hpp>
+-#include <ext/intel/esimd.hpp>
++#include <sycl/version.hpp>
++#include <sycl/sycl.hpp>
++#include <sycl/ext/intel/esimd.hpp>
+ 
+ template <class T>
+ using remove_const_t = typename std::remove_const<T>::type;
+diff --git a/include/common/core/debug.hpp b/include/common/core/debug.hpp
+index 857d2bc..4b88633 100644
+--- a/include/common/core/debug.hpp
++++ b/include/common/core/debug.hpp
+@@ -17,8 +17,8 @@
+ #pragma once
+ 
+ #include "common/core/common.hpp"
+-#include <CL/sycl.hpp>
+-#include <ext/intel/esimd.hpp>
++#include <sycl/sycl.hpp>
++#include <sycl/ext/intel/esimd.hpp>
+ 
+ namespace gpu::xetla {
+ 
+diff --git a/include/experimental/kernel/gemm/impl/int4_dequantize_kslicing_xe.hpp b/include/experimental/kernel/gemm/impl/int4_dequantize_kslicing_xe.hpp
+index 3657013..6766cf7 100644
+--- a/include/experimental/kernel/gemm/impl/int4_dequantize_kslicing_xe.hpp
++++ b/include/experimental/kernel/gemm/impl/int4_dequantize_kslicing_xe.hpp
+@@ -272,7 +272,7 @@ public:
+ 
+     /// @brief Host helper function to get the expected local range under the current GEMM config.
+     /// @return Expected local range.
+-    static cl::sycl::range<3> get_local_range() {
++    static sycl::range<3> get_local_range() {
+         uint32_t local_range_m = (wg_tile_m + sg_tile_m - 1) / sg_tile_m;
+         uint32_t local_range_n = (wg_tile_n + sg_tile_n - 1) / sg_tile_n;
+         #ifdef DEBUG
+@@ -280,7 +280,7 @@ public:
+                   << local_range_m << ", " << local_range_n << "} \n";
+         #endif
+         assert(local_range_m * local_range_n * num_local_kslicing <= 32);
+-        return cl::sycl::range<3> {
++        return sycl::range<3> {
+                 num_local_kslicing, local_range_m, local_range_n};
+     };
+ 
+@@ -288,7 +288,7 @@ public:
+     /// @param matrix_m Is the size of the m dimension of the matrix multiplication (m x k x n).
+     /// @param matrix_n Is the size of the n dimension of the matrix multiplication (m x k x n).
+     /// @return Expected group range.
+-    static cl::sycl::range<3> get_group_range(
++    static sycl::range<3> get_group_range(
+             uint32_t matrix_m, uint32_t matrix_n) {
+         uint32_t group_range_m = (matrix_m + wg_tile_m - 1) / wg_tile_m;
+         uint32_t group_range_n = (matrix_n + wg_tile_n - 1) / wg_tile_n;
+@@ -297,18 +297,18 @@ public:
+         std::cout << "Group range: {" << num_global_kslicing << ", "
+                   << group_range_m << ", " << group_range_n << "} \n";
+         #endif
+-        return cl::sycl::range<3> {
++        return sycl::range<3> {
+                 num_global_kslicing, group_range_m, group_range_n};
+     };
+ 
+     /// @brief Host helper function to get the expected nd_range under the current GEMM config.
+     /// @param args Is the GEMM arguments for application-related runtime variables.
+     /// @return Expected nd_range.
+-    static cl::sycl::nd_range<3> get_nd_range(arguments_t &args) {
+-        cl::sycl::range<3> local_range = get_local_range();
+-        cl::sycl::range<3> group_range
++    static sycl::nd_range<3> get_nd_range(arguments_t &args) {
++        sycl::range<3> local_range = get_local_range();
++        sycl::range<3> group_range
+                 = get_group_range(args.matrix_m, args.matrix_n);
+-        return cl::sycl::nd_range<3> {group_range * local_range, local_range};
++        return sycl::nd_range<3> {group_range * local_range, local_range};
+     };
+ 
+     /// @brief Host helper function to get the expected accumulation buffer size of the current GEMM config.
+diff --git a/include/kernel/gemm/dispatch_policy.hpp b/include/kernel/gemm/dispatch_policy.hpp
+index e122889..c12b25b 100644
+--- a/include/kernel/gemm/dispatch_policy.hpp
++++ b/include/kernel/gemm/dispatch_policy.hpp
+@@ -184,9 +184,9 @@ struct dispatch_policy_stream_k {
+ 
+     /// @brief Host helper function to get the expected nd_range under the current GEMM config.
+     /// @return Expected nd_range.
+-    cl::sycl::range<3> get_group_range() const {
+-        cl::sycl::range<3> group_range
+-                = cl::sycl::range<3> {1, 1, num_workgroups};
++    sycl::range<3> get_group_range() const {
++        sycl::range<3> group_range
++                = sycl::range<3> {1, 1, num_workgroups};
+         return group_range;
+     };
+ 
+diff --git a/include/kernel/gemm/impl/default_xe.hpp b/include/kernel/gemm/impl/default_xe.hpp
+index 501ff71..f60e40d 100644
+--- a/include/kernel/gemm/impl/default_xe.hpp
++++ b/include/kernel/gemm/impl/default_xe.hpp
+@@ -183,7 +183,7 @@ public:
+ 
+     /// @brief Host helper function to get the expected local range under the current GEMM_UNIVERSAL config.
+     /// @return Expected local range.
+-    static cl::sycl::range<3> get_local_range() {
++    static sycl::range<3> get_local_range() {
+         uint32_t local_range_m = (wg_tile_m + sg_tile_m - 1) / sg_tile_m;
+         uint32_t local_range_n = (wg_tile_n + sg_tile_n - 1) / sg_tile_n;
+         #ifdef DEBUG
+@@ -191,14 +191,14 @@ public:
+                   << local_range_n << "} \n";
+         #endif
+         assert(local_range_m * local_range_n <= 32);
+-        return cl::sycl::range<3> {1, local_range_m, local_range_n};
++        return sycl::range<3> {1, local_range_m, local_range_n};
+     };
+ 
+     /// @brief Host helper function to get the expected group range under the current GEMM_UNIVERSAL config.
+     /// @param matrix_m Is the size of the m dimension of the matrix multiplication (m x k x n).
+     /// @param matrix_n Is the size of the n dimension of the matrix multiplication (m x k x n).
+     /// @return Expected group range.
+-    static cl::sycl::range<3> get_group_range(
++    static sycl::range<3> get_group_range(
+             uint32_t matrix_m, uint32_t matrix_n) {
+         uint32_t group_range_m = (matrix_m + wg_tile_m - 1) / wg_tile_m;
+         uint32_t group_range_n = (matrix_n + wg_tile_n - 1) / wg_tile_n;
+@@ -207,17 +207,17 @@ public:
+         std::cout << "Group range: {" << 1 << ", " << group_range_m << ", "
+                   << group_range_n << "} \n";
+         #endif
+-        return cl::sycl::range<3> {1, group_range_m, group_range_n};
++        return sycl::range<3> {1, group_range_m, group_range_n};
+     };
+ 
+     /// @brief Host helper function to get the expected nd_range under the current GEMM_UNIVERSAL config.
+     /// @param args Is the GEMM_UNIVERSAL arguments for application-related runtime variables.
+     /// @return Expected nd_range.
+-    static cl::sycl::nd_range<3> get_nd_range(arguments_t &args) {
+-        cl::sycl::range<3> local_range = get_local_range();
+-        cl::sycl::range<3> group_range
++    static sycl::nd_range<3> get_nd_range(arguments_t &args) {
++        sycl::range<3> local_range = get_local_range();
++        sycl::range<3> group_range
+                 = get_group_range(args.matrix_m, args.matrix_n);
+-        return cl::sycl::nd_range<3> {group_range * local_range, local_range};
++        return sycl::nd_range<3> {group_range * local_range, local_range};
+     };
+ 
+     /// @brief Check if the arguments can be implemented.
+diff --git a/include/kernel/gemm/impl/kslicing_xe.hpp b/include/kernel/gemm/impl/kslicing_xe.hpp
+index 5d6459d..7a460d0 100644
+--- a/include/kernel/gemm/impl/kslicing_xe.hpp
++++ b/include/kernel/gemm/impl/kslicing_xe.hpp
+@@ -246,7 +246,7 @@ public:
+ 
+     /// @brief Host helper function to get the expected local range under the current GEMM_UNIVERSAL config.
+     /// @return Expected local range.
+-    static cl::sycl::range<3> get_local_range() {
++    static sycl::range<3> get_local_range() {
+         uint32_t local_range_m = (wg_tile_m + sg_tile_m - 1) / sg_tile_m;
+         uint32_t local_range_n = (wg_tile_n + sg_tile_n - 1) / sg_tile_n;
+         #ifdef DEBUG
+@@ -254,7 +254,7 @@ public:
+                   << local_range_m << ", " << local_range_n << "} \n";
+         #endif
+         assert(local_range_m * local_range_n * num_local_kslicing <= 32);
+-        return cl::sycl::range<3> {
++        return sycl::range<3> {
+                 num_local_kslicing, local_range_m, local_range_n};
+     };
+ 
+@@ -262,7 +262,7 @@ public:
+     /// @param matrix_m Is the size of the m dimension of the matrix multiplication (m x k x n).
+     /// @param matrix_n Is the size of the n dimension of the matrix multiplication (m x k x n).
+     /// @return Expected group range.
+-    static cl::sycl::range<3> get_group_range(
++    static sycl::range<3> get_group_range(
+             uint32_t matrix_m, uint32_t matrix_n) {
+         uint32_t group_range_m = (matrix_m + wg_tile_m - 1) / wg_tile_m;
+         uint32_t group_range_n = (matrix_n + wg_tile_n - 1) / wg_tile_n;
+@@ -271,18 +271,18 @@ public:
+         std::cout << "Group range: {" << num_global_kslicing << ", "
+                   << group_range_m << ", " << group_range_n << "} \n";
+         #endif
+-        return cl::sycl::range<3> {
++        return sycl::range<3> {
+                 num_global_kslicing, group_range_m, group_range_n};
+     };
+ 
+     /// @brief Host helper function to get the expected nd_range of the current GEMM_UNIVERSAL config.
+     /// @param args Is the GEMM_UNIVERSAL arguments for application-related runtime variables.
+     /// @return Expected nd_range.
+-    static cl::sycl::nd_range<3> get_nd_range(arguments_t &args) {
+-        cl::sycl::range<3> local_range = get_local_range();
+-        cl::sycl::range<3> group_range
++    static sycl::nd_range<3> get_nd_range(arguments_t &args) {
++        sycl::range<3> local_range = get_local_range();
++        sycl::range<3> group_range
+                 = get_group_range(args.matrix_m, args.matrix_n);
+-        return cl::sycl::nd_range<3> {group_range * local_range, local_range};
++        return sycl::nd_range<3> {group_range * local_range, local_range};
+     };
+ 
+     /// @brief Host helper function to get the expected accumulation buffer size of the current GEMM_UNIVERSAL config.
+diff --git a/include/kernel/gemm/impl/stream_k_xe.hpp b/include/kernel/gemm/impl/stream_k_xe.hpp
+index 0299d8b..76c8756 100644
+--- a/include/kernel/gemm/impl/stream_k_xe.hpp
++++ b/include/kernel/gemm/impl/stream_k_xe.hpp
+@@ -224,7 +224,7 @@ public:
+ 
+     /// @brief Host helper function to get the expected local range under the current GEMM config.
+     /// @return Expected local range.
+-    static cl::sycl::range<3> get_local_range() {
++    static sycl::range<3> get_local_range() {
+         uint32_t local_range_m = (wg_tile_m + sg_tile_m - 1) / sg_tile_m;
+         uint32_t local_range_n = (wg_tile_n + sg_tile_n - 1) / sg_tile_n;
+         #ifdef DEBUG
+@@ -233,15 +233,15 @@ public:
+         #endif
+         assert(local_range_m * local_range_n <= 32);
+         //Linearize for stream_k algorithm
+-        return cl::sycl::range<3> {1, 1, local_range_m * local_range_n};
++        return sycl::range<3> {1, 1, local_range_m * local_range_n};
+     };
+ 
+     /// @brief Host helper function to get the expected nd_range under the current GEMM config.
+     /// @return Expected nd_range.
+-    static cl::sycl::nd_range<3> get_nd_range(arguments_t &args) {
+-        cl::sycl::range<3> local_range = get_local_range();
+-        cl::sycl::range<3> group_range = args.stream_k_args.get_group_range();
+-        return cl::sycl::nd_range<3> {group_range * local_range, local_range};
++    static sycl::nd_range<3> get_nd_range(arguments_t &args) {
++        sycl::range<3> local_range = get_local_range();
++        sycl::range<3> group_range = args.stream_k_args.get_group_range();
++        return sycl::nd_range<3> {group_range * local_range, local_range};
+     };
+ 
+     /// @brief Host helper function to get the expected accumulation buffer size of the current STREAMK_GEMM_UNIVERSAL config.
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index c915fd7..7432b69 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -1,2 +1,5 @@
++add_compile_definitions(XETLA_ENABLE_GTEST_REPORTING)
++link_libraries(GTest::gtest GTest::gtest_main)
++
+ add_subdirectory(./integration)
+ add_subdirectory(./unit)
+diff --git a/tests/integration/data_transformer/common.hpp b/tests/integration/data_transformer/common.hpp
+index caa70c2..a6d9daa 100644
+--- a/tests/integration/data_transformer/common.hpp
++++ b/tests/integration/data_transformer/common.hpp
+@@ -19,7 +19,7 @@
+ #include "xetla.hpp"
+ 
+ using namespace gpu::xetla;
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ template <typename data_type_in, typename data_type_out, typename data_type_acc>
+ int data_transformer_result_validate(data_type_in *in_device,
+diff --git a/tests/integration/data_transformer/main.cpp b/tests/integration/data_transformer/main.cpp
+index 56c6c3d..59a04d8 100644
+--- a/tests/integration/data_transformer/main.cpp
++++ b/tests/integration/data_transformer/main.cpp
+@@ -20,7 +20,7 @@
+ #include <gtest/gtest.h>
+ 
+ using namespace gpu::xetla;
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ template <class Test>
+ static void data_transformer_run() {
+@@ -76,11 +76,11 @@ static void data_transformer_run() {
+             },
+             queue, device, context);
+ 
+-    cl::sycl::range<3> group_range {1, (matrix_m + wg_tile_m - 1) / wg_tile_m,
++    sycl::range<3> group_range {1, (matrix_m + wg_tile_m - 1) / wg_tile_m,
+             (matrix_n + wg_tile_n - 1) / wg_tile_n};
+-    cl::sycl::range<3> local_range {1, (wg_tile_m + sg_tile_m - 1) / sg_tile_m,
++    sycl::range<3> local_range {1, (wg_tile_m + sg_tile_m - 1) / sg_tile_m,
+             (wg_tile_n + sg_tile_n - 1) / sg_tile_n};
+-    cl::sycl::nd_range<3> nd_range(group_range * local_range, local_range);
++    sycl::nd_range<3> nd_range(group_range * local_range, local_range);
+ 
+     std::vector<kernel_id> kernelId = {get_kernel_id<Test>()};
+     auto inputBundle
+@@ -125,7 +125,7 @@ static void data_transformer_run() {
+         });
+         e_esimd.wait();
+ 
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         FAIL();
+     }
+diff --git a/tests/integration/gemm/bf16_stream_k/main.cpp b/tests/integration/gemm/bf16_stream_k/main.cpp
+index b9f1920..658e65d 100644
+--- a/tests/integration/gemm/bf16_stream_k/main.cpp
++++ b/tests/integration/gemm/bf16_stream_k/main.cpp
+@@ -369,7 +369,7 @@ void stream_k_gemm_run(uint32_t iter) {
+                 A, matrix_k, B, matrix_n, C, matrix_n, Acc, matrix_n, Cnt,
+                 size_cnt, stream_k, epilogue_args);
+ 
+-        cl::sycl::nd_range<3> NDRange = gemm_op_t::get_nd_range(gemm_arg);
++        sycl::nd_range<3> NDRange = gemm_op_t::get_nd_range(gemm_arg);
+ 
+         if (!gemm_op_t::can_implement(gemm_arg)) {
+             std::cout << "The arguments cannot be supported, aborting ... "
+@@ -411,7 +411,7 @@ void stream_k_gemm_run(uint32_t iter) {
+                       << std::endl;
+             FAIL();
+         }
+-        cl::sycl::nd_range<3> NDRange = gemm_op_t::get_nd_range(gemm_arg);
++        sycl::nd_range<3> NDRange = gemm_op_t::get_nd_range(gemm_arg);
+ 
+         for (uint32_t i = 0; i < iter + warmup; i++) {
+             if (i >= warmup) { prof.cpu_start(); }
+diff --git a/tests/integration/gemm/int4_dequantization/main.cpp b/tests/integration/gemm/int4_dequantization/main.cpp
+index 6e9d79f..3a48903 100644
+--- a/tests/integration/gemm/int4_dequantization/main.cpp
++++ b/tests/integration/gemm/int4_dequantization/main.cpp
+@@ -309,7 +309,7 @@ void dequantize_gemm_run(uint32_t iter) {
+             matrix_k, B_d, matrix_n, C_d, matrix_n, scale_d, matrix_n,
+             zero_pt_d, matrix_n, Acc_d, Cnt_d);
+ 
+-    cl::sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
++    sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
+     if (!gemm_op_t::can_implement(gemm_arg)) {
+         std::cout << "The arguments cannot be supported, aborting ... "
+                   << std::endl;
+@@ -334,7 +334,7 @@ void dequantize_gemm_run(uint32_t iter) {
+             prof.cpu_end();
+             prof.add_gpu_event(e_esimd);
+         }
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         FAIL();
+     }
+diff --git a/tests/integration/gemm/int8_quantization/main.cpp b/tests/integration/gemm/int8_quantization/main.cpp
+index 9fdf6ce..72fdeb6 100644
+--- a/tests/integration/gemm/int8_quantization/main.cpp
++++ b/tests/integration/gemm/int8_quantization/main.cpp
+@@ -85,9 +85,9 @@ static void igemm_quantize_run(int iter = 100) {
+     size_t group_range_n = (matrix_n + wg_tile_n - 1) / wg_tile_n;
+     size_t subgroup_range_m = (wg_tile_m + sg_tile_m - 1) / sg_tile_m;
+     size_t subgroup_range_n = (wg_tile_n + sg_tile_n - 1) / sg_tile_n;
+-    cl::sycl::range<3> group_range {1, group_range_m, group_range_n};
+-    cl::sycl::range<3> local_range {1, subgroup_range_m, subgroup_range_n};
+-    cl::sycl::nd_range<3> nd_range(group_range * local_range, local_range);
++    sycl::range<3> group_range {1, group_range_m, group_range_n};
++    sycl::range<3> local_range {1, subgroup_range_m, subgroup_range_n};
++    sycl::nd_range<3> nd_range(group_range * local_range, local_range);
+     std::cout << "group_num_x: " << group_range_n
+               << ", group_num_y: " << group_range_m << ", group_num_z: " << 1
+               << "\n";
+@@ -127,7 +127,7 @@ static void igemm_quantize_run(int iter = 100) {
+             prof.cpu_end();
+             prof.add_gpu_event(e_esimd);
+         }
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         FAIL();
+     }
+diff --git a/tests/integration/gemm/tf32/main.cpp b/tests/integration/gemm/tf32/main.cpp
+index 472f19d..45fed05 100644
+--- a/tests/integration/gemm/tf32/main.cpp
++++ b/tests/integration/gemm/tf32/main.cpp
+@@ -40,7 +40,7 @@ using tf32_gemm_func = tf32_gemm_test_func<typename Test::data_type_a,
+         Test::layout_a, Test::layout_b, Test::global_kslicing,
+         Test::local_kslicing>;
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ std::string esimd_compile_string
+         = " -vc-codegen -doubleGRF "
+diff --git a/tests/integration/layer_norm/backward/common.hpp b/tests/integration/layer_norm/backward/common.hpp
+index f8d6b14..f1fb135 100644
+--- a/tests/integration/layer_norm/backward/common.hpp
++++ b/tests/integration/layer_norm/backward/common.hpp
+@@ -19,7 +19,7 @@
+ #include "xetla.hpp"
+ #include "gtest/gtest.h"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ using namespace gpu;
+ using namespace gpu::xetla;
+ 
+diff --git a/tests/integration/layer_norm/backward/main.cpp b/tests/integration/layer_norm/backward/main.cpp
+index a8c02b9..2c1ec26 100644
+--- a/tests/integration/layer_norm/backward/main.cpp
++++ b/tests/integration/layer_norm/backward/main.cpp
+@@ -19,7 +19,7 @@
+ #include "utils/utils.hpp"
+ #include "gtest/gtest.h"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ template <typename test>
+ void ln_bwd_run() {
+@@ -164,19 +164,19 @@ void ln_bwd_run() {
+             },
+             queue, device, context);
+ 
+-    cl::sycl::range<3> group_range {1, test::wg_num_m, test::wg_num_n};
+-    cl::sycl::range<3> local_range {1,
++    sycl::range<3> group_range {1, test::wg_num_m, test::wg_num_n};
++    sycl::range<3> local_range {1,
+             (test::wg_m + test::sg_m - 1) / test::sg_m,
+             (test::wg_n + test::sg_n - 1) / test::sg_n};
+-    cl::sycl::nd_range<3> nd_range(group_range * local_range, local_range);
++    sycl::nd_range<3> nd_range(group_range * local_range, local_range);
+ 
+     // 3 buffers.
+-    cl::sycl::range<3> final_group_range {
++    sycl::range<3> final_group_range {
+             3, 1, (final_mat_n + final_wg_n - 1) / final_wg_n};
+-    cl::sycl::range<3> final_local_range {1,
++    sycl::range<3> final_local_range {1,
+             (final_wg_m + final_sg_m - 1) / final_sg_m,
+             (final_wg_n + final_sg_n - 1) / final_sg_n};
+-    cl::sycl::nd_range<3> final_range(
++    sycl::nd_range<3> final_range(
+             final_group_range * final_local_range, final_local_range);
+ 
+     try {
+@@ -221,7 +221,7 @@ void ln_bwd_run() {
+             });
+         });
+         e_esimd_bwd1.wait();
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         FAIL();
+     }
+diff --git a/tests/integration/layer_norm/forward/common.hpp b/tests/integration/layer_norm/forward/common.hpp
+index c633004..4304791 100644
+--- a/tests/integration/layer_norm/forward/common.hpp
++++ b/tests/integration/layer_norm/forward/common.hpp
+@@ -19,7 +19,7 @@
+ #include "utils/buff_compare.hpp"
+ #include "gtest/gtest.h"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ template <typename data_type_x, typename data_type_weight, typename data_type_y,
+         typename data_type_acc = float>
+diff --git a/tests/integration/layer_norm/forward/main.cpp b/tests/integration/layer_norm/forward/main.cpp
+index 71a022d..248e942 100644
+--- a/tests/integration/layer_norm/forward/main.cpp
++++ b/tests/integration/layer_norm/forward/main.cpp
+@@ -19,7 +19,7 @@
+ #include "utils/utils.hpp"
+ #include "gtest/gtest.h"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ template <typename test>
+ void ln_fwd_run() {
+@@ -125,11 +125,11 @@ void ln_fwd_run() {
+             },
+             queue, device, context);
+ 
+-    cl::sycl::range<3> group_range {1, test::wg_num_m, test::wg_num_n};
+-    cl::sycl::range<3> local_range {1,
++    sycl::range<3> group_range {1, test::wg_num_m, test::wg_num_n};
++    sycl::range<3> local_range {1,
+             (test::wg_m + test::sg_m - 1) / test::sg_m,
+             (test::wg_n + test::sg_n - 1) / test::sg_n};
+-    cl::sycl::nd_range<3> nd_range(group_range * local_range, local_range);
++    sycl::nd_range<3> nd_range(group_range * local_range, local_range);
+ 
+     try {
+         auto e_esimd = queue.submit([&](handler &cgh) {
+@@ -156,7 +156,7 @@ void ln_fwd_run() {
+             });
+         });
+         e_esimd.wait();
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         FAIL();
+     }
+diff --git a/tests/integration/row_reduction/common.hpp b/tests/integration/row_reduction/common.hpp
+index 9a9bfea..07fc04d 100644
+--- a/tests/integration/row_reduction/common.hpp
++++ b/tests/integration/row_reduction/common.hpp
+@@ -21,7 +21,7 @@
+ #include "xetla.hpp"
+ #include "gtest/gtest.h"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ using namespace gpu;
+ using namespace gpu::xetla;
+ 
+diff --git a/tests/integration/row_reduction/main.cpp b/tests/integration/row_reduction/main.cpp
+index c7c1058..c8bb919 100644
+--- a/tests/integration/row_reduction/main.cpp
++++ b/tests/integration/row_reduction/main.cpp
+@@ -20,7 +20,7 @@
+ #include "utils/common.hpp"
+ #include "gtest/gtest.h"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ template <typename Test>
+ static void row_reduction_run() {
+@@ -104,10 +104,10 @@ static void row_reduction_run() {
+             },
+             queue, device, context);
+ 
+-    cl::sycl::range<3> group_range {1, 1, (matrix_n + wg_n - 1) / wg_n};
+-    cl::sycl::range<3> local_range {
++    sycl::range<3> group_range {1, 1, (matrix_n + wg_n - 1) / wg_n};
++    sycl::range<3> local_range {
+             1, (wg_m + sg_m - 1) / sg_m, (wg_n + sg_n - 1) / sg_n};
+-    cl::sycl::nd_range<3> nd_range(group_range * local_range, local_range);
++    sycl::nd_range<3> nd_range(group_range * local_range, local_range);
+ 
+     try {
+         auto e_esimd = queue.submit([&](handler &cgh) {
+@@ -130,7 +130,7 @@ static void row_reduction_run() {
+             });
+         });
+         e_esimd.wait();
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         FAIL();
+     }
+diff --git a/tests/integration/sg_dropout_op/common.hpp b/tests/integration/sg_dropout_op/common.hpp
+index 3c906b8..f281f2a 100644
+--- a/tests/integration/sg_dropout_op/common.hpp
++++ b/tests/integration/sg_dropout_op/common.hpp
+@@ -22,7 +22,7 @@
+ #include "xetla.hpp"
+ #include "gtest/gtest.h"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ using namespace gpu;
+ using namespace gpu::xetla;
+ 
+diff --git a/tests/integration/sg_dropout_op/main.cpp b/tests/integration/sg_dropout_op/main.cpp
+index 5cf3d0e..fda3585 100644
+--- a/tests/integration/sg_dropout_op/main.cpp
++++ b/tests/integration/sg_dropout_op/main.cpp
+@@ -20,7 +20,7 @@
+ #include "utils/common.hpp"
+ #include "gtest/gtest.h"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ template <typename test>
+ static void dropout_op_run() {
+@@ -78,13 +78,13 @@ static void dropout_op_run() {
+             },
+             queue, device, context);
+ 
+-    cl::sycl::range<3> group_range {1,
++    sycl::range<3> group_range {1,
+             (test::mat_m + test::wg_m - 1) / test::wg_m,
+             (test::mat_n + test::wg_n - 1) / test::wg_n};
+-    cl::sycl::range<3> local_range {1,
++    sycl::range<3> local_range {1,
+             (test::wg_m + test::sg_m - 1) / test::sg_m,
+             (test::wg_n + test::sg_n - 1) / test::sg_n};
+-    cl::sycl::nd_range<3> nd_range(group_range * local_range, local_range);
++    sycl::nd_range<3> nd_range(group_range * local_range, local_range);
+ 
+     try {
+         auto e_esimd = queue.submit([&](handler &cgh) {
+@@ -99,7 +99,7 @@ static void dropout_op_run() {
+             });
+         });
+         e_esimd.wait();
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         FAIL();
+     }
+diff --git a/tests/integration/softmax/softmax_bwd.cpp b/tests/integration/softmax/softmax_bwd.cpp
+index 10ab162..5000489 100644
+--- a/tests/integration/softmax/softmax_bwd.cpp
++++ b/tests/integration/softmax/softmax_bwd.cpp
+@@ -80,9 +80,9 @@ void softmax_bwd_run() {
+               << ",  group_num_y: " << group_range_m << "\n";
+     std::cout << " group_size_x: " << subgroup_range_n
+               << ",  group_size_y: " << subgroup_range_m << std::endl;
+-    cl::sycl::range<3> group_range {1, group_range_m, group_range_n};
+-    cl::sycl::range<3> local_range {1, subgroup_range_m, subgroup_range_n};
+-    cl::sycl::nd_range<3> nd_range(group_range * local_range, local_range);
++    sycl::range<3> group_range {1, group_range_m, group_range_n};
++    sycl::range<3> local_range {1, subgroup_range_m, subgroup_range_n};
++    sycl::nd_range<3> nd_range(group_range * local_range, local_range);
+ 
+     long transferred_bytes = sizeof(data_type_in) * size_in
+             + sizeof(data_type_out) * size_out
+@@ -125,7 +125,7 @@ void softmax_bwd_run() {
+             });
+             e_softmax_bwd.wait();
+ 
+-        } catch (cl::sycl::exception const &e) {
++        } catch (sycl::exception const &e) {
+             std::cout << "SYCL exception caught: " << e.what() << '\n';
+             FAIL();
+         }
+diff --git a/tests/integration/softmax/softmax_fwd.cpp b/tests/integration/softmax/softmax_fwd.cpp
+index da6d3a6..e703dbb 100644
+--- a/tests/integration/softmax/softmax_fwd.cpp
++++ b/tests/integration/softmax/softmax_fwd.cpp
+@@ -73,9 +73,9 @@ void softmax_fwd_run() {
+               << ",  group_num_y: " << group_range_m << "\n";
+     std::cout << " group_size_x: " << subgroup_range_n
+               << ",  group_size_y: " << subgroup_range_m << std::endl;
+-    cl::sycl::range<3> group_range {1, group_range_m, group_range_n};
+-    cl::sycl::range<3> local_range {1, subgroup_range_m, subgroup_range_n};
+-    cl::sycl::nd_range<3> nd_range(group_range * local_range, local_range);
++    sycl::range<3> group_range {1, group_range_m, group_range_n};
++    sycl::range<3> local_range {1, subgroup_range_m, subgroup_range_n};
++    sycl::nd_range<3> nd_range(group_range * local_range, local_range);
+ 
+     // esimd kernel prepratation and execution
+     {
+@@ -113,7 +113,7 @@ void softmax_fwd_run() {
+             });
+             e_softmax_fwd.wait();
+ 
+-        } catch (cl::sycl::exception const &e) {
++        } catch (sycl::exception const &e) {
+             std::cout << "SYCL exception caught: " << e.what() << '\n';
+             FAIL();
+         }
+diff --git a/tests/integration/vector_add/bf16_2d/common.hpp b/tests/integration/vector_add/bf16_2d/common.hpp
+index 5d7b675..0926cda 100644
+--- a/tests/integration/vector_add/bf16_2d/common.hpp
++++ b/tests/integration/vector_add/bf16_2d/common.hpp
+@@ -18,7 +18,7 @@
+ #include "utils/utils.hpp"
+ #include "xetla.hpp"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ using namespace gpu;
+ using namespace gpu::xetla;
+ 
+diff --git a/tests/integration/vector_add/bf16_2d/main.cpp b/tests/integration/vector_add/bf16_2d/main.cpp
+index f7d81af..3149ff1 100644
+--- a/tests/integration/vector_add/bf16_2d/main.cpp
++++ b/tests/integration/vector_add/bf16_2d/main.cpp
+@@ -50,9 +50,9 @@ static void vadd_run() {
+             queue, device, context);
+ 
+     // each thread process 16x16 block
+-    cl::sycl::range<1> global_range {size / BL / BL};
+-    cl::sycl::range<1> local_range {group_size};
+-    cl::sycl::nd_range<1> nd_range(global_range, local_range);
++    sycl::range<1> global_range {size / BL / BL};
++    sycl::range<1> local_range {group_size};
++    sycl::nd_range<1> nd_range(global_range, local_range);
+ 
+     try {
+         auto e_esimd = queue.submit([&](handler &cgh) {
+@@ -61,7 +61,7 @@ static void vadd_run() {
+             });
+         });
+         e_esimd.wait();
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         FAIL();
+     }
+diff --git a/tests/integration/vector_add/int32_1d/common.hpp b/tests/integration/vector_add/int32_1d/common.hpp
+index d5192be..a132698 100644
+--- a/tests/integration/vector_add/int32_1d/common.hpp
++++ b/tests/integration/vector_add/int32_1d/common.hpp
+@@ -22,7 +22,7 @@ using namespace gpu;
+ using namespace gpu::xetla;
+ 
+ #define data_type int
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ int vadd_result_validate(data_type *A_device, data_type *B_device,
+         data_type *C_device, unsigned Size, sycl::queue &queue) {
+diff --git a/tests/integration/vector_add/int32_1d/main.cpp b/tests/integration/vector_add/int32_1d/main.cpp
+index 956f687..5a66a00 100644
+--- a/tests/integration/vector_add/int32_1d/main.cpp
++++ b/tests/integration/vector_add/int32_1d/main.cpp
+@@ -50,9 +50,9 @@ static void vadd_run() {
+             queue, device, context);
+ 
+     // We need that many workitems. Each processes VL elements of data.
+-    cl::sycl::range<1> global_range {size / VL};
+-    cl::sycl::range<1> local_range {group_size};
+-    cl::sycl::nd_range<1> nd_range(global_range, local_range);
++    sycl::range<1> global_range {size / VL};
++    sycl::range<1> local_range {group_size};
++    sycl::nd_range<1> nd_range(global_range, local_range);
+ 
+     try {
+         auto e_esimd = queue.submit([&](handler &cgh) {
+@@ -61,7 +61,7 @@ static void vadd_run() {
+             });
+         });
+         e_esimd.wait();
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         FAIL();
+     }
+diff --git a/tests/integration/vector_add/int32_2d/common.hpp b/tests/integration/vector_add/int32_2d/common.hpp
+index 6e75426..2f63722 100644
+--- a/tests/integration/vector_add/int32_2d/common.hpp
++++ b/tests/integration/vector_add/int32_2d/common.hpp
+@@ -21,7 +21,7 @@
+ class Test1;
+ 
+ #define data_type int
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ int vadd_result_validate(data_type *A_device, data_type *B_device,
+         data_type *C_device, unsigned Size, sycl::queue &queue) {
+diff --git a/tests/integration/vector_add/int32_2d/main.cpp b/tests/integration/vector_add/int32_2d/main.cpp
+index 2d43cee..bd9be08 100644
+--- a/tests/integration/vector_add/int32_2d/main.cpp
++++ b/tests/integration/vector_add/int32_2d/main.cpp
+@@ -49,9 +49,9 @@ static void vadd_run() {
+             queue, device, context);
+ 
+     // each thread process 16x16 block
+-    cl::sycl::range<1> global_range {size / BL / BL};
+-    cl::sycl::range<1> local_range {group_size};
+-    cl::sycl::nd_range<1> nd_range(global_range, local_range);
++    sycl::range<1> global_range {size / BL / BL};
++    sycl::range<1> local_range {group_size};
++    sycl::nd_range<1> nd_range(global_range, local_range);
+ 
+     try {
+         auto e_esimd = queue.submit([&](handler &cgh) {
+@@ -60,7 +60,7 @@ static void vadd_run() {
+             });
+         });
+         e_esimd.wait();
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         FAIL();
+     }
+diff --git a/tests/integration/vector_add/tf32_1d/common.hpp b/tests/integration/vector_add/tf32_1d/common.hpp
+index 22b7890..922ed62 100644
+--- a/tests/integration/vector_add/tf32_1d/common.hpp
++++ b/tests/integration/vector_add/tf32_1d/common.hpp
+@@ -25,7 +25,7 @@ using namespace gpu::xetla;
+ class Test1;
+ 
+ #define data_type tf32
+-using namespace cl::sycl;
++using namespace sycl;
+ 
+ int vadd_result_validate(data_type *A_device, data_type *B_device,
+         data_type *C_device, unsigned Size, sycl::queue &queue) {
+diff --git a/tests/integration/vector_add/tf32_1d/main.cpp b/tests/integration/vector_add/tf32_1d/main.cpp
+index 4fa262f..64b72b9 100644
+--- a/tests/integration/vector_add/tf32_1d/main.cpp
++++ b/tests/integration/vector_add/tf32_1d/main.cpp
+@@ -50,9 +50,9 @@ static void vadd_run() {
+             queue, device, context);
+ 
+     // We need that many workitems. Each processes VL elements of data.
+-    cl::sycl::range<1> global_range {size / VL};
+-    cl::sycl::range<1> local_range {group_size};
+-    cl::sycl::nd_range<1> nd_range(global_range, local_range);
++    sycl::range<1> global_range {size / VL};
++    sycl::range<1> local_range {group_size};
++    sycl::nd_range<1> nd_range(global_range, local_range);
+ 
+     try {
+         auto e_esimd = queue.submit([&](handler &cgh) {
+@@ -61,7 +61,7 @@ static void vadd_run() {
+             });
+         });
+         e_esimd.wait();
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         FAIL();
+     }
+diff --git a/tests/unit/add_c/main.cpp b/tests/unit/add_c/main.cpp
+index 9e042bd..6e4d3d3 100644
+--- a/tests/unit/add_c/main.cpp
++++ b/tests/unit/add_c/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(test_add_update_carry, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(add_update_carry_result_validate, _1, _2, _3, 16);
+     kernel_run<uint32_t, add_update_carry_func<uint32_t, 16>>(
+diff --git a/tests/unit/bit_mask_manipulation/main.cpp b/tests/unit/bit_mask_manipulation/main.cpp
+index a81c3e8..a68eed1 100644
+--- a/tests/unit/bit_mask_manipulation/main.cpp
++++ b/tests/unit/bit_mask_manipulation/main.cpp
+@@ -26,7 +26,7 @@ using namespace std::placeholders;
+ /// - xetla_shl API with [2 src] [with return] [all channel enabled].
+ TEST(shl_with_vector_input, esimd) {
+     kernel_run<uint64_t, shl_with_vector_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::shl_vector));
+ }
+@@ -37,7 +37,7 @@ TEST(shl_with_vector_input, esimd) {
+ /// - xetla_shl API with [2 src] [with return] [all channel enabled].
+ TEST(shl_with_scalar_input, esimd) {
+     kernel_run<uint64_t, shl_with_scalar_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::shl_scalar));
+ }
+@@ -48,7 +48,7 @@ TEST(shl_with_scalar_input, esimd) {
+ /// - xetla_shr API with [2 src] [with return] [all channel enabled].
+ TEST(shr_with_vector_input, esimd) {
+     kernel_run<uint64_t, shr_with_vector_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::shr_vector));
+ }
+@@ -59,7 +59,7 @@ TEST(shr_with_vector_input, esimd) {
+ /// - xetla_shr API with [2 src] [with return] [all channel enabled].
+ TEST(shr_with_scalar_input, esimd) {
+     kernel_run<uint64_t, shr_with_scalar_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::shr_scalar));
+ }
+@@ -70,7 +70,7 @@ TEST(shr_with_scalar_input, esimd) {
+ /// - xetla_rol API with [2 src] [with return] [all channel enabled].
+ TEST(rol_with_2_vector_input, esimd) {
+     kernel_run<uint64_t, rol_with_2_vector_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::rol_vector));
+ }
+@@ -81,7 +81,7 @@ TEST(rol_with_2_vector_input, esimd) {
+ /// - xetla_rol API with [2 src] [with return] [all channel enabled].
+ TEST(rol_with_a_vector_and_a_scalar_input, esimd) {
+     kernel_run<uint64_t, rol_with_a_vector_and_a_scalar_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::rol_vector));
+ }
+@@ -92,7 +92,7 @@ TEST(rol_with_a_vector_and_a_scalar_input, esimd) {
+ /// - xetla_rol API with [2 src] [with return] [all channel enabled].
+ TEST(rol_with_2_scalar_input, esimd) {
+     kernel_run<uint64_t, rol_with_2_scalar_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::rol_scalar));
+ }
+@@ -103,7 +103,7 @@ TEST(rol_with_2_scalar_input, esimd) {
+ /// - xetla_ror API with [2 src] [with return] [all channel enabled].
+ TEST(ror_with_2_vector_input, esimd) {
+     kernel_run<uint64_t, ror_with_2_vector_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::ror_vector));
+ }
+@@ -114,7 +114,7 @@ TEST(ror_with_2_vector_input, esimd) {
+ /// - xetla_ror API with [2 src] [with return] [all channel enabled].
+ TEST(ror_with_a_vector_and_a_scalar_input, esimd) {
+     kernel_run<uint64_t, ror_with_a_vector_and_a_scalar_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::ror_vector));
+ }
+@@ -125,7 +125,7 @@ TEST(ror_with_a_vector_and_a_scalar_input, esimd) {
+ /// - xetla_ror API with [2 src] [with return] [all channel enabled].
+ TEST(ror_with_2_scalar_input, esimd) {
+     kernel_run<uint64_t, ror_with_2_scalar_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::ror_scalar));
+ }
+@@ -136,7 +136,7 @@ TEST(ror_with_2_scalar_input, esimd) {
+ /// - xetla_lsr API with [2 src] [with return] [all channel enabled].
+ TEST(lsr_with_vector_input, esimd) {
+     kernel_run<uint64_t, lsr_with_vector_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::lsr_vector));
+ }
+@@ -147,7 +147,7 @@ TEST(lsr_with_vector_input, esimd) {
+ /// - xetla_lsr API with [2 src] [with return] [all channel enabled].
+ TEST(lsr_with_scalar_input, esimd) {
+     kernel_run<uint64_t, lsr_with_scalar_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::lsr_scalar));
+ }
+@@ -158,7 +158,7 @@ TEST(lsr_with_scalar_input, esimd) {
+ /// - xetla_asr API with [2 src] [with return] [all channel enabled].
+ TEST(asr_with_vector_input, esimd) {
+     kernel_run<uint64_t, asr_with_vector_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::asr_vector));
+ }
+@@ -169,7 +169,7 @@ TEST(asr_with_vector_input, esimd) {
+ /// - xetla_asr API with [2 src] [with return] [all channel enabled].
+ TEST(asr_with_scalar_input, esimd) {
+     kernel_run<uint64_t, asr_with_scalar_input<uint64_t, 16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(bit_shift_result_validate<uint64_t>, _1, _2, _3, 16,
+                     bit_shift_op::asr_scalar));
+ }
+diff --git a/tests/unit/block_load_store/main.cpp b/tests/unit/block_load_store/main.cpp
+index 34086dc..27b4119 100644
+--- a/tests/unit/block_load_store/main.cpp
++++ b/tests/unit/block_load_store/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(block_load_store, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             block_load_store_result_validate, _1, _2, _3, 32, 16, 16);
+     kernel_run<int, block_load_store_func<int, 32, 32, 32, 16, 16>>(
+diff --git a/tests/unit/epilogue_tile_op/main.cpp b/tests/unit/epilogue_tile_op/main.cpp
+index ee03e08..65923ee 100644
+--- a/tests/unit/epilogue_tile_op/main.cpp
++++ b/tests/unit/epilogue_tile_op/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(tile_elemwise_op_relu, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_elemwise_op_validate<float, relu_op<float>>, _1,
+                     _2, _3, 128, 16, 16);
+@@ -31,7 +31,7 @@ TEST(tile_elemwise_op_relu, esimd) {
+ }
+ 
+ TEST(tile_elemwise_op_gelu_fwd, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_elemwise_op_validate<float, gelu_op<float>>, _1,
+                     _2, _3, 128, 16, 24);
+@@ -41,7 +41,7 @@ TEST(tile_elemwise_op_gelu_fwd, esimd) {
+ }
+ 
+ TEST(tile_elemwise_op_gelu_fwd_w, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_elemwise_op_validate<float, gelu_fwd_w_op<float>>,
+                     _1, _2, _3, 128, 16, 24);
+@@ -52,7 +52,7 @@ TEST(tile_elemwise_op_gelu_fwd_w, esimd) {
+ }
+ 
+ TEST(tile_elemwise_op_gelu_bwd, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_elemwise_gelu_bwd_validate<float>, _1, _2, _3, 128, 16, 24);
+     kernel_run<float,
+@@ -62,7 +62,7 @@ TEST(tile_elemwise_op_gelu_bwd, esimd) {
+ }
+ 
+ TEST(tile_elemwise_op_bias_add, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_elemwise_bias_add_validate<float>, _1, _2, _3, 128, 16, 24);
+     kernel_run<float,
+@@ -72,7 +72,7 @@ TEST(tile_elemwise_op_bias_add, esimd) {
+ }
+ 
+ TEST(tile_elemwise_op_res_add, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_elemwise_res_add_validate<float>, _1, _2, _3, 128, 16, 24);
+     kernel_run<float,
+@@ -82,7 +82,7 @@ TEST(tile_elemwise_op_res_add, esimd) {
+ }
+ 
+ TEST(tile_elemwise_op_linear_op, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_elemwise_linear_op_validate<float>, _1, _2, _3, 128, 16, 32);
+     kernel_run<float,
+@@ -92,7 +92,7 @@ TEST(tile_elemwise_op_linear_op, esimd) {
+ }
+ 
+ TEST(tile_elemwise_op_linear_op_2, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_elemwise_linear_op_validate<float>, _1, _2, _3, 128, 16, 24);
+     kernel_run<float,
+diff --git a/tests/unit/exp_inv_sqrt_tanh/main.cpp b/tests/unit/exp_inv_sqrt_tanh/main.cpp
+index cb5ff5f..86f939d 100644
+--- a/tests/unit/exp_inv_sqrt_tanh/main.cpp
++++ b/tests/unit/exp_inv_sqrt_tanh/main.cpp
+@@ -21,14 +21,14 @@
+ using namespace std::placeholders;
+ 
+ TEST(test_exp_fp32, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             kernel_validation<float, exp_op<float>>, _1, _2, _3, 16);
+     kernel_run<float, exp_func<float, 16>>(nd_range, result_validate);
+ }
+ 
+ TEST(test_exp_fp16, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(kernel_validation<fp16, exp_op<fp16>>, _1, _2, _3, 16);
+     kernel_run<float, exp_func<fp16, 16>>(nd_range, result_validate);
+@@ -37,14 +37,14 @@ TEST(test_exp_fp16, esimd) {
+ ////for exp2
+ 
+ TEST(test_exp2_fp32, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             kernel_validation<float, exp2_op<float>>, _1, _2, _3, 16);
+     kernel_run<float, exp2_func<float, 16>>(nd_range, result_validate);
+ }
+ 
+ TEST(test_exp2_fp16, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(kernel_validation<fp16, exp2_op<fp16>>, _1, _2, _3, 16);
+     kernel_run<float, exp2_func<fp16, 16>>(nd_range, result_validate);
+@@ -53,14 +53,14 @@ TEST(test_exp2_fp16, esimd) {
+ ////for inv
+ 
+ TEST(test_inv_fp32, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             kernel_validation<float, inv_op<float>>, _1, _2, _3, 16);
+     kernel_run<float, inv_func<float, 16>>(nd_range, result_validate);
+ }
+ 
+ TEST(test_inv_fp16, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(kernel_validation<fp16, inv_op<fp16>>, _1, _2, _3, 16);
+     kernel_run<float, inv_func<fp16, 16>>(nd_range, result_validate);
+@@ -69,14 +69,14 @@ TEST(test_inv_fp16, esimd) {
+ ////for sqrt
+ 
+ TEST(test_sqrt_fp32, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             kernel_validation<float, sqrt_op<float>>, _1, _2, _3, 16);
+     kernel_run<float, sqrt_func<float, 16>>(nd_range, result_validate);
+ }
+ 
+ TEST(test_sqrt_fp16, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(kernel_validation<fp16, sqrt_op<fp16>>, _1, _2, _3, 16);
+     kernel_run<float, sqrt_func<fp16, 16>>(nd_range, result_validate);
+@@ -85,7 +85,7 @@ TEST(test_sqrt_fp16, esimd) {
+ ////for sqrt_ieee
+ 
+ TEST(test_sqrt_ieee_fp32, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             kernel_validation<float, sqrt_ieee_op<float>>, _1, _2, _3, 16);
+     kernel_run<float, sqrt_ieee_func<float, 16>>(nd_range, result_validate);
+@@ -94,14 +94,14 @@ TEST(test_sqrt_ieee_fp32, esimd) {
+ ////for rsqrt
+ 
+ TEST(test_rsqrt_fp32, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             kernel_validation<float, rsqrt_op<float>>, _1, _2, _3, 16);
+     kernel_run<float, rsqrt_func<float, 16>>(nd_range, result_validate);
+ }
+ 
+ TEST(test_rsqrt_fp16, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             kernel_validation<fp16, rsqrt_op<fp16>>, _1, _2, _3, 16);
+     kernel_run<float, rsqrt_func<fp16, 16>>(nd_range, result_validate);
+@@ -110,7 +110,7 @@ TEST(test_rsqrt_fp16, esimd) {
+ ////for tanh
+ 
+ TEST(test_tanh_fp32, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             kernel_validation<float, tanh_op<float>>, _1, _2, _3, 16);
+     kernel_run<float, tanh_func<float, 16>>(nd_range, result_validate);
+@@ -119,7 +119,7 @@ TEST(test_tanh_fp32, esimd) {
+ ////for tanh
+ 
+ TEST(test_tanh_fp32_long_vector, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     constexpr int elem_size = 128;
+     auto result_validate = std::bind(
+             kernel_validation<float, tanh_op<float>>, _1, _2, _3, elem_size);
+diff --git a/tests/unit/global_atomic/main.cpp b/tests/unit/global_atomic/main.cpp
+index 222f70e..9edcd9e 100644
+--- a/tests/unit/global_atomic/main.cpp
++++ b/tests/unit/global_atomic/main.cpp
+@@ -26,7 +26,7 @@ using namespace std::placeholders;
+ /// - xetla_atomic_global API with [0 src] [no return] [all channel enabled].
+ TEST(global_atomic_iinc_base, esimd) {
+     kernel_run<int, global_atomic_iinc_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<int>, _1, _2, _3, 16,
+                     atomic_op::iinc));
+ }
+@@ -37,7 +37,7 @@ TEST(global_atomic_iinc_base, esimd) {
+ /// - xetla_atomic_global API with [0 src] [no return] [4 channel enabled].
+ TEST(global_atomic_iinc_mask, esimd) {
+     kernel_run<int, global_atomic_iinc_mask<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_with_mask_result_validate<int>, _1, _2, _3,
+                     16, atomic_op::iinc, 0xF));
+ }
+@@ -48,7 +48,7 @@ TEST(global_atomic_iinc_mask, esimd) {
+ /// - xetla_atomic_global API with [0 src] [with return] [all channel enabled].
+ TEST(global_atomic_iinc_return, esimd) {
+     kernel_run<int, global_atomic_iinc_return<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_with_ret_result_validate<int>, _1, _2, _3,
+                     16, atomic_op::iinc));
+ }
+@@ -59,7 +59,7 @@ TEST(global_atomic_iinc_return, esimd) {
+ /// - xetla_atomic_global API with [0 src] [no return] [all channel enabled].
+ TEST(global_atomic_idec_base, esimd) {
+     kernel_run<int, global_atomic_idec_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<int>, _1, _2, _3, 16,
+                     atomic_op::idec));
+ }
+@@ -70,7 +70,7 @@ TEST(global_atomic_idec_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_iadd_base, esimd) {
+     kernel_run<int, global_atomic_iadd_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<int>, _1, _2, _3, 16,
+                     atomic_op::iadd));
+ }
+@@ -81,7 +81,7 @@ TEST(global_atomic_iadd_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [4 channel enabled].
+ TEST(global_atomic_iadd_mask, esimd) {
+     kernel_run<int, global_atomic_iadd_mask<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_with_mask_result_validate<int>, _1, _2, _3,
+                     16, atomic_op::iadd, 0xF));
+ }
+@@ -92,7 +92,7 @@ TEST(global_atomic_iadd_mask, esimd) {
+ /// - xetla_atomic_global API with [1 src] [with return] [all channel enabled].
+ TEST(global_atomic_iadd_return, esimd) {
+     kernel_run<int, global_atomic_iadd_return<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_with_ret_result_validate<int>, _1, _2, _3,
+                     16, atomic_op::iadd));
+ }
+@@ -103,7 +103,7 @@ TEST(global_atomic_iadd_return, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_isub_base, esimd) {
+     kernel_run<int, global_atomic_isub_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<int>, _1, _2, _3, 16,
+                     atomic_op::isub));
+ }
+@@ -114,7 +114,7 @@ TEST(global_atomic_isub_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_smin_base, esimd) {
+     kernel_run<int, global_atomic_smin_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<int>, _1, _2, _3, 16,
+                     atomic_op::smin));
+ }
+@@ -125,7 +125,7 @@ TEST(global_atomic_smin_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_smax_base, esimd) {
+     kernel_run<int, global_atomic_smax_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<int>, _1, _2, _3, 16,
+                     atomic_op::smax));
+ }
+@@ -136,7 +136,7 @@ TEST(global_atomic_smax_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_fadd_base, esimd) {
+     kernel_run<float, global_atomic_fadd_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<float>, _1, _2, _3, 16,
+                     atomic_op::fadd));
+ }
+@@ -147,7 +147,7 @@ TEST(global_atomic_fadd_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_fsub_base, esimd) {
+     kernel_run<float, global_atomic_fsub_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<float>, _1, _2, _3, 16,
+                     atomic_op::fsub));
+ }
+@@ -158,7 +158,7 @@ TEST(global_atomic_fsub_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_fmin_base, esimd) {
+     kernel_run<float, global_atomic_fmin_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<float>, _1, _2, _3, 16,
+                     atomic_op::fmin));
+ }
+@@ -169,7 +169,7 @@ TEST(global_atomic_fmin_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_fmax_base, esimd) {
+     kernel_run<float, global_atomic_fmax_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<float>, _1, _2, _3, 16,
+                     atomic_op::fmax));
+ }
+@@ -179,7 +179,7 @@ TEST(global_atomic_fmax_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_umin_base, esimd) {
+     kernel_run<uint32_t, global_atomic_umin_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<uint32_t>, _1, _2, _3, 16,
+                     atomic_op::umin));
+ }
+@@ -190,7 +190,7 @@ TEST(global_atomic_umin_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_umax_base, esimd) {
+     kernel_run<uint32_t, global_atomic_umax_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<uint32_t>, _1, _2, _3, 16,
+                     atomic_op::umax));
+ }
+@@ -201,7 +201,7 @@ TEST(global_atomic_umax_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_bit_and_base, esimd) {
+     kernel_run<uint32_t, global_atomic_bit_and_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_bit_op_result_validate, _1, _2, _3, 16,
+                     atomic_op::bit_and));
+ }
+@@ -212,7 +212,7 @@ TEST(global_atomic_bit_and_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_bit_or_base, esimd) {
+     kernel_run<uint32_t, global_atomic_bit_or_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_bit_op_result_validate, _1, _2, _3, 16,
+                     atomic_op::bit_or));
+ }
+@@ -223,7 +223,7 @@ TEST(global_atomic_bit_or_base, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_bit_xor_base, esimd) {
+     kernel_run<uint32_t, global_atomic_bit_xor_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_bit_op_result_validate, _1, _2, _3, 16,
+                     atomic_op::bit_xor));
+ }
+@@ -234,7 +234,7 @@ TEST(global_atomic_bit_xor_base, esimd) {
+ /// - xetla_atomic_global API with [0 src] [with return] [all channel enabled].
+ TEST(global_atomic_load, esimd) {
+     kernel_run<uint32_t, global_atomic_load<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<uint32_t>, _1, _2, _3, 16,
+                     atomic_op::load));
+ }
+@@ -244,7 +244,7 @@ TEST(global_atomic_load, esimd) {
+ /// - xetla_atomic_global API with [1 src] [no return] [all channel enabled].
+ TEST(global_atomic_store, esimd) {
+     kernel_run<uint32_t, global_atomic_store<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<uint32_t>, _1, _2, _3, 16,
+                     atomic_op::store));
+ }
+@@ -254,7 +254,7 @@ TEST(global_atomic_store, esimd) {
+ /// - xetla_atomic_global API with [2 src] [no return] [all channel enabled].
+ TEST(global_atomic_cmpxchg_base, esimd) {
+     kernel_run<uint32_t, global_atomic_cmpxchg_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<uint32_t>, _1, _2, _3, 16,
+                     atomic_op::cmpxchg));
+ }
+@@ -265,7 +265,7 @@ TEST(global_atomic_cmpxchg_base, esimd) {
+ /// - xetla_atomic_global API with [2 src] [no return] [4 channel enabled].
+ TEST(global_atomic_cmpxchg_mask, esimd) {
+     kernel_run<uint32_t, global_atomic_cmpxchg_mask<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_with_mask_result_validate<uint32_t>, _1, _2,
+                     _3, 16, atomic_op::cmpxchg, 0xF));
+ }
+@@ -276,7 +276,7 @@ TEST(global_atomic_cmpxchg_mask, esimd) {
+ /// - xetla_atomic_global API with [2 src] [with return] [all channel enabled].
+ TEST(global_atomic_cmpxchg_return, esimd) {
+     kernel_run<uint32_t, global_atomic_cmpxchg_return<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_with_ret_result_validate<uint32_t>, _1, _2,
+                     _3, 16, atomic_op::cmpxchg));
+ }
+@@ -286,7 +286,7 @@ TEST(global_atomic_cmpxchg_return, esimd) {
+ /// - xetla_atomic_global API with [2 src] [no return] [all channel enabled].
+ TEST(global_atomic_fcmpxchg_base, esimd) {
+     kernel_run<float, global_atomic_fcmpxchg_base<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(global_atomic_result_validate<float>, _1, _2, _3, 16,
+                     atomic_op::fcmpxchg));
+ }
+diff --git a/tests/unit/global_load_store/main_block.cpp b/tests/unit/global_load_store/main_block.cpp
+index 140388a..0665274 100644
+--- a/tests/unit/global_load_store/main_block.cpp
++++ b/tests/unit/global_load_store/main_block.cpp
+@@ -29,7 +29,7 @@ using namespace std::placeholders;
+ ///------------------------------------------------------------------
+ 
+ TEST(load_store_block_default, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(load_store_result_validate<int>, _1, _2, _3, 16);
+     kernel_run<int, global_load_store_block_default<int, 16>>(
+@@ -46,7 +46,7 @@ TEST(load_store_block_default, esimd) {
+ ///------------------------------------------------------------------
+ 
+ TEST(load_store_block_default_ref, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(load_store_result_validate<int>, _1, _2, _3, 16);
+     kernel_run<int, global_load_store_block_default_ref<int, 16>>(
+@@ -69,7 +69,7 @@ TYPED_TEST_SUITE_P(load_store_block_datatype_test);
+ TYPED_TEST_P(load_store_block_datatype_test, esimd) {
+     using datatype = TypeParam;
+ 
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(load_store_result_validate<datatype>, _1, _2, _3, 16);
+     kernel_run<datatype, global_load_store_block_default<datatype, 16>>(
+@@ -100,7 +100,7 @@ TYPED_TEST_P(load_block_cache_test, esimd) {
+     constexpr cache_hint L1H = std::tuple_element_t<0, TypeParam>::value;
+     constexpr cache_hint L2H = std::tuple_element_t<1, TypeParam>::value;
+ 
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(load_store_result_validate<int>, _1, _2, _3, 16);
+     kernel_run<int, global_load_block_cache<int, 16, L1H, L2H>>(
+@@ -135,7 +135,7 @@ TYPED_TEST_P(store_block_cache_test, esimd) {
+     constexpr cache_hint L1H = std::tuple_element_t<0, TypeParam>::value;
+     constexpr cache_hint L2H = std::tuple_element_t<1, TypeParam>::value;
+ 
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(load_store_result_validate<int>, _1, _2, _3, 16);
+     kernel_run<int, global_store_block_cache<int, 16, L1H, L2H>>(
+@@ -170,7 +170,7 @@ TYPED_TEST_P(prefetch_block_cache_test, esimd) {
+     constexpr cache_hint L1H = std::tuple_element_t<0, TypeParam>::value;
+     constexpr cache_hint L2H = std::tuple_element_t<1, TypeParam>::value;
+ 
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(load_store_result_validate<int>, _1, _2, _3, 16);
+     kernel_run<int, global_prefetch_block<int, 16, L1H, L2H>>(
+@@ -205,7 +205,7 @@ TYPED_TEST_SUITE_P(prefetch_block_datatype_test);
+ TYPED_TEST_P(prefetch_block_datatype_test, esimd) {
+     using datatype = TypeParam;
+ 
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(load_store_result_validate<datatype>, _1, _2, _3, 16);
+     kernel_run<datatype,
+diff --git a/tests/unit/global_load_store/main_scatter.cpp b/tests/unit/global_load_store/main_scatter.cpp
+index 7a0cf62..767921e 100644
+--- a/tests/unit/global_load_store/main_scatter.cpp
++++ b/tests/unit/global_load_store/main_scatter.cpp
+@@ -35,7 +35,7 @@ TYPED_TEST_SUITE_P(load_scatter_datatype_test);
+ TYPED_TEST_P(load_scatter_datatype_test, esimd) {
+     using datatype = TypeParam;
+ 
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     // For load mask kernel, the masked value would be 0 in buffer A and write to bufferB
+     auto result_validate
+             = std::bind(mask_result_validate<datatype>, _1, _2, _3, 16, 0xF, 0);
+@@ -67,7 +67,7 @@ TYPED_TEST_SUITE_P(prefetch_scatter_datatype_test);
+ TYPED_TEST_P(prefetch_scatter_datatype_test, esimd) {
+     using datatype = TypeParam;
+ 
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     // For load mask kernel, the masked value would be 0 in buffer A and write to bufferB
+     auto result_validate
+             = std::bind(mask_result_validate<datatype>, _1, _2, _3, 16, 0xF, 0);
+@@ -99,7 +99,7 @@ TYPED_TEST_SUITE_P(store_scatter_datatype_test);
+ TYPED_TEST_P(store_scatter_datatype_test, esimd) {
+     using datatype = TypeParam;
+ 
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     // For store mask kernel, we write buffer B as value of SIMD in advance, so masked channel value should be 16
+     auto result_validate = std::bind(
+             mask_result_validate<datatype>, _1, _2, _3, 16, 0xF, 16);
+@@ -125,7 +125,7 @@ INSTANTIATE_TYPED_TEST_SUITE_P(
+ ///------------------------------------------------------------------
+ 
+ TEST(load_store_scatter_nelts2, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(load_store_result_validate<int>, _1, _2, _3, 32);
+     kernel_run<int, global_load_store_scatter_nelt2<int, 16>>(
+diff --git a/tests/unit/imul/main.cpp b/tests/unit/imul/main.cpp
+index 221155c..0c04627 100644
+--- a/tests/unit/imul/main.cpp
++++ b/tests/unit/imul/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(test_imul, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(imul_result_validate, _1, _2, _3, 16);
+     kernel_run<uint32_t, imul_func<uint32_t, 16>>(nd_range, result_validate);
+ }
+diff --git a/tests/unit/internal_type_load_store_cvt/main.cpp b/tests/unit/internal_type_load_store_cvt/main.cpp
+index a86665e..9059e24 100644
+--- a/tests/unit/internal_type_load_store_cvt/main.cpp
++++ b/tests/unit/internal_type_load_store_cvt/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(bf16_block_load_store_cvt, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             block_load_store_result_validate<bf16>, _1, _2, _3, 32, 16, 16);
+     kernel_run<bf16, load_store_cvt_func<bf16, 32, 32, 32, 16, 16>>(
+@@ -29,7 +29,7 @@ TEST(bf16_block_load_store_cvt, esimd) {
+ }
+ 
+ TEST(tf32_block_load_store_cvt, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             block_load_store_result_validate<tf32>, _1, _2, _3, 32, 16, 16);
+     kernel_run<tf32, load_store_cvt_func<tf32, 32, 32, 32, 16, 16>>(
+@@ -37,7 +37,7 @@ TEST(tf32_block_load_store_cvt, esimd) {
+ }
+ 
+ TEST(fp16_block_load_store_cvt, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             block_load_store_result_validate<fp16>, _1, _2, _3, 32, 16, 16);
+     kernel_run<fp16, load_store_cvt_func<fp16, 32, 32, 32, 16, 16>>(
+diff --git a/tests/unit/local_load_store/main.cpp b/tests/unit/local_load_store/main.cpp
+index 93bdf29..a214d01 100644
+--- a/tests/unit/local_load_store/main.cpp
++++ b/tests/unit/local_load_store/main.cpp
+@@ -35,7 +35,7 @@ TYPED_TEST_SUITE_P(load_store_block_datatype_test);
+ TYPED_TEST_P(load_store_block_datatype_test, esimd) {
+     using datatype = TypeParam;
+ 
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             local_load_store_result_validate<datatype>, _1, _2, _3, 16);
+     kernel_run<datatype, local_load_store_block<datatype, 16>>(
+@@ -66,7 +66,7 @@ TYPED_TEST_SUITE_P(load_store_scatter_datatype_test);
+ TYPED_TEST_P(load_store_scatter_datatype_test, esimd) {
+     using datatype = TypeParam;
+ 
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             local_load_store_result_validate<datatype>, _1, _2, _3, 16);
+     kernel_run<datatype, local_load_store_scatter<datatype, 16>>(
+@@ -91,7 +91,7 @@ INSTANTIATE_TYPED_TEST_SUITE_P(
+ ///------------------------------------------------------------------
+ 
+ TEST(local_load_scatter_mask, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(mask_result_validate<int>, _1, _2, _3, 16, 0xF, 0);
+     kernel_run<int, local_load_scatter_mask<int, 16>>(
+@@ -108,7 +108,7 @@ TEST(local_load_scatter_mask, esimd) {
+ ///------------------------------------------------------------------
+ 
+ TEST(local_store_scatter_mask, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(mask_result_validate<int>, _1, _2, _3, 16, 0xF, 16);
+     kernel_run<int, local_store_scatter_mask<int, 16>>(
+@@ -125,7 +125,7 @@ TEST(local_store_scatter_mask, esimd) {
+ ///------------------------------------------------------------------
+ 
+ TEST(local_store_scatter_nelts2, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(local_load_store_result_validate<int>, _1, _2, _3, 32);
+     kernel_run<int, local_load_store_scatter_nelt2<int, 16>>(
+diff --git a/tests/unit/math_general/main.cpp b/tests/unit/math_general/main.cpp
+index 1542019..a48f8ad 100644
+--- a/tests/unit/math_general/main.cpp
++++ b/tests/unit/math_general/main.cpp
+@@ -28,7 +28,7 @@ using namespace std::placeholders;
+ TEST(test_abs_vector_version_with_different_input_and_output_types, esimd) {
+     kernel_run<int,
+             xetla_abs_vector_version_with_different_input_and_output_types<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(math_result_validate<int>, _1, _2, _3, 16,
+                     math_op::abs_vector));
+ }
+@@ -41,7 +41,7 @@ TEST(test_abs_vector_version_with_different_input_and_output_types, esimd) {
+ TEST(test_abs_vector_version_with_same_input_and_output_types, esimd) {
+     kernel_run<int,
+             xetla_abs_vector_version_with_same_input_and_output_types<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(math_result_validate<int>, _1, _2, _3, 16,
+                     math_op::abs_vector));
+ }
+@@ -54,7 +54,7 @@ TEST(test_abs_vector_version_with_same_input_and_output_types, esimd) {
+ TEST(test_abs_scalar_version_with_different_input_and_output_types, esimd) {
+     kernel_run<int,
+             xetla_abs_scalar_version_with_different_input_and_output_types<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(math_result_validate<int>, _1, _2, _3, 16,
+                     math_op::abs_scalar));
+ }
+@@ -67,7 +67,7 @@ TEST(test_abs_scalar_version_with_different_input_and_output_types, esimd) {
+ TEST(test_abs_scalar_version_with_same_input_and_output_types, esimd) {
+     kernel_run<int,
+             xetla_abs_scalar_version_with_same_input_and_output_types<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(math_result_validate<int>, _1, _2, _3, 16,
+                     math_op::abs_scalar));
+ }
+@@ -79,7 +79,7 @@ TEST(test_abs_scalar_version_with_same_input_and_output_types, esimd) {
+ 
+ TEST(test_max_with_vector_Src0_and_vector_Src1, esimd) {
+     kernel_run<int, xetla_max_with_vector_Src0_and_vector_Src1<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(math_result_validate<int>, _1, _2, _3, 16,
+                     math_op::max_vector));
+ }
+@@ -91,7 +91,7 @@ TEST(test_max_with_vector_Src0_and_vector_Src1, esimd) {
+ 
+ TEST(test_max_with_vector_Src0_and_scalar_Src1, esimd) {
+     kernel_run<int, xetla_max_with_vector_Src0_and_scalar_Src1<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(math_result_validate<int>, _1, _2, _3, 16,
+                     math_op::max_vector));
+ }
+@@ -103,7 +103,7 @@ TEST(test_max_with_vector_Src0_and_scalar_Src1, esimd) {
+ 
+ TEST(test_max_with_scalar_Src0_and_vector_Src1, esimd) {
+     kernel_run<int, xetla_max_with_scalar_Src0_and_vector_Src1<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(math_result_validate<int>, _1, _2, _3, 16,
+                     math_op::max_vector));
+ }
+@@ -115,7 +115,7 @@ TEST(test_max_with_scalar_Src0_and_vector_Src1, esimd) {
+ 
+ TEST(test_max_with_scalar_Src0_and_scalar_Src1, esimd) {
+     kernel_run<int, xetla_max_with_scalar_Src0_and_scalar_Src1<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(math_result_validate<int>, _1, _2, _3, 16,
+                     math_op::max_scalar));
+ }
+@@ -127,7 +127,7 @@ TEST(test_max_with_scalar_Src0_and_scalar_Src1, esimd) {
+ 
+ TEST(test_min_with_vector_Src0_and_vector_Src1, esimd) {
+     kernel_run<int, xetla_min_with_vector_Src0_and_vector_Src1<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(math_result_validate<int>, _1, _2, _3, 16,
+                     math_op::min_vector));
+ }
+@@ -139,7 +139,7 @@ TEST(test_min_with_vector_Src0_and_vector_Src1, esimd) {
+ 
+ TEST(test_min_with_vector_Src0_and_scalar_Src1, esimd) {
+     kernel_run<int, xetla_min_with_vector_Src0_and_scalar_Src1<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(math_result_validate<int>, _1, _2, _3, 16,
+                     math_op::min_vector));
+ }
+@@ -151,7 +151,7 @@ TEST(test_min_with_vector_Src0_and_scalar_Src1, esimd) {
+ 
+ TEST(test_min_with_scalar_Src0_and_vector_Src1, esimd) {
+     kernel_run<int, xetla_min_with_scalar_Src0_and_vector_Src1<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(math_result_validate<int>, _1, _2, _3, 16,
+                     math_op::min_vector));
+ }
+@@ -163,7 +163,7 @@ TEST(test_min_with_scalar_Src0_and_vector_Src1, esimd) {
+ 
+ TEST(test_min_with_scalar_Src0_and_scalar_Src1, esimd) {
+     kernel_run<int, xetla_min_with_scalar_Src0_and_scalar_Src1<16>>(
+-            cl::sycl::nd_range<1>({1}, {1}),
++            sycl::nd_range<1>({1}, {1}),
+             std::bind(math_result_validate<int>, _1, _2, _3, 16,
+                     math_op::min_scalar));
+ }
+diff --git a/tests/unit/named_barrier/main.cpp b/tests/unit/named_barrier/main.cpp
+index 14c0838..209dcc5 100644
+--- a/tests/unit/named_barrier/main.cpp
++++ b/tests/unit/named_barrier/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(test_named_barrier, esimd) {
+-    cl::sycl::nd_range<1> nd_range({16}, {16});
++    sycl::nd_range<1> nd_range({16}, {16});
+     auto result_validate
+             = std::bind(named_barrier_result_validate, _1, _2, _3, 16);
+     kernel_run<int, named_barrier_func<int, 16>>(nd_range, result_validate);
+@@ -37,7 +37,7 @@ TEST(test_named_barrier, esimd) {
+ ///------------------------------------------------------------------
+ 
+ TEST(test_named_barrier_producer_consumer_1, esimd) {
+-    cl::sycl::nd_range<1> nd_range({4}, {4});
++    sycl::nd_range<1> nd_range({4}, {4});
+     auto result_validate
+             = std::bind(named_barrier_split_validate, _1, _2, _3, 32, 2);
+     kernel_run<int, named_barrier_producer_consumer_1_func<int, 16>>(
+@@ -55,7 +55,7 @@ TEST(test_named_barrier_producer_consumer_1, esimd) {
+ ///------------------------------------------------------------------
+ 
+ TEST(test_named_barrier_producer_consumer_2, esimd) {
+-    cl::sycl::nd_range<1> nd_range({32}, {32});
++    sycl::nd_range<1> nd_range({32}, {32});
+     auto result_validate
+             = std::bind(named_barrier_split_validate, _1, _2, _3, 256, 2);
+     kernel_run<int, named_barrier_producer_consumer_2_func<int, 16>>(
+@@ -73,7 +73,7 @@ TEST(test_named_barrier_producer_consumer_2, esimd) {
+ ///------------------------------------------------------------------
+ 
+ TEST(test_named_barrier_producer_consumer_3, esimd) {
+-    cl::sycl::nd_range<1> nd_range({16}, {16});
++    sycl::nd_range<1> nd_range({16}, {16});
+     auto result_validate
+             = std::bind(named_barrier_split_validate, _1, _2, _3, 128, 6);
+     kernel_run<int, named_barrier_producer_consumer_3_func<int, 16>>(
+diff --git a/tests/unit/philox_rng/main.cpp b/tests/unit/philox_rng/main.cpp
+index 447a20c..190e4b8 100644
+--- a/tests/unit/philox_rng/main.cpp
++++ b/tests/unit/philox_rng/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(test_rand, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(rand_result_validate, _1, _2, _3, 16);
+     kernel_run<uint32_t, rand_func<uint32_t, 16>>(nd_range, result_validate);
+ }
+diff --git a/tests/unit/raw_send/main.cpp b/tests/unit/raw_send/main.cpp
+index 665e2bb..ed2a95f 100644
+--- a/tests/unit/raw_send/main.cpp
++++ b/tests/unit/raw_send/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(test_raw_send_with_2_source_and_no_return, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(raw_send_result_validate, _1, _2, _3, 16);
+     kernel_run<int, raw_send_with_2_source_and_1_destination_func<int, 16>>(
+             nd_range, result_validate);
+diff --git a/tests/unit/reg_layout_conversion/main.cpp b/tests/unit/reg_layout_conversion/main.cpp
+index a16a931..9ff2d2b 100644
+--- a/tests/unit/reg_layout_conversion/main.cpp
++++ b/tests/unit/reg_layout_conversion/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(test_linear_layout_1, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(kernel_validation<float>, _1, _2, _3, 32, 32);
+     kernel_run<float, conversion_func<float, 32, 32, 16, 16>>(
+@@ -29,7 +29,7 @@ TEST(test_linear_layout_1, esimd) {
+ }
+ 
+ TEST(test_linear_layout_2, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(kernel_validation<float>, _1, _2, _3, 32, 30);
+     kernel_run<float, conversion_func<float, 32, 30, 16, 16>>(
+@@ -37,7 +37,7 @@ TEST(test_linear_layout_2, esimd) {
+ }
+ 
+ TEST(test_linear_layout_3, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(kernel_validation<float>, _1, _2, _3, 64, 64);
+     kernel_run<float, conversion_func<float, 64, 64, 16, 16>>(
+@@ -45,7 +45,7 @@ TEST(test_linear_layout_3, esimd) {
+ }
+ 
+ TEST(test_linear_layout_4, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(kernel_validation<float>, _1, _2, _3, 64, 60);
+     kernel_run<float, conversion_func<float, 64, 60, 16, 16>>(
+diff --git a/tests/unit/reg_reduce/main.cpp b/tests/unit/reg_reduce/main.cpp
+index fed5fd6..c25f777 100644
+--- a/tests/unit/reg_reduce/main.cpp
++++ b/tests/unit/reg_reduce/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(test_reduce_add_fp32, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             kernel_validation<float, reduce_sum<float>>, _1, _2, _3, 64);
+     kernel_run<float, reduce_func<float, 64, reduce_op::sum>>(
+@@ -29,7 +29,7 @@ TEST(test_reduce_add_fp32, esimd) {
+ }
+ 
+ TEST(test_reduce_mul_fp32, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             kernel_validation<float, reduce_prod<float>>, _1, _2, _3, 64);
+     kernel_run<float, reduce_func<float, 64, reduce_op::prod>>(
+@@ -37,7 +37,7 @@ TEST(test_reduce_mul_fp32, esimd) {
+ }
+ 
+ TEST(test_reduce_min_fp32, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             kernel_validation<float, reduce_min<float>>, _1, _2, _3, 64);
+     kernel_run<float, reduce_func<float, 64, reduce_op::min>>(
+@@ -45,7 +45,7 @@ TEST(test_reduce_min_fp32, esimd) {
+ }
+ 
+ TEST(test_reduce_max_fp32, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             kernel_validation<float, reduce_max<float>>, _1, _2, _3, 16);
+     kernel_run<float, reduce_func<float, 16, reduce_op::max>>(
+diff --git a/tests/unit/tile_load_store/main.cpp b/tests/unit/tile_load_store/main.cpp
+index 1e6d008..c51a012 100644
+--- a/tests/unit/tile_load_store/main.cpp
++++ b/tests/unit/tile_load_store/main.cpp
+@@ -36,7 +36,7 @@ using namespace std::placeholders;
+ // 0  x  x
+ // 0  x  x
+ TEST(tile_padding_load_store_1, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_padding_load_store_result_validate<int>, _1, _2,
+                     _3, 16, 16, -1, -1);
+@@ -50,7 +50,7 @@ TEST(tile_padding_load_store_1, esimd) {
+ // x  x  x
+ // x  x  x
+ TEST(tile_padding_load_store_2, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_padding_load_store_result_validate<int>, _1, _2,
+                     _3, 16, 16, 0, -1);
+@@ -64,7 +64,7 @@ TEST(tile_padding_load_store_2, esimd) {
+ // x  x  0
+ // x  x  0
+ TEST(tile_padding_load_store_3, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_padding_load_store_result_validate<int>, _1, _2,
+                     _3, 16, 16, 1, -1);
+@@ -78,7 +78,7 @@ TEST(tile_padding_load_store_3, esimd) {
+ // 0  x  x
+ // 0  x  x
+ TEST(tile_padding_load_store_4, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_padding_load_store_result_validate<int>, _1, _2,
+                     _3, 16, 16, -1, 0);
+@@ -92,7 +92,7 @@ TEST(tile_padding_load_store_4, esimd) {
+ // x  x  x
+ // x  x  x
+ TEST(tile_padding_load_store_5, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_padding_load_store_result_validate<int>, _1, _2,
+                     _3, 16, 16, 0, 0);
+@@ -106,7 +106,7 @@ TEST(tile_padding_load_store_5, esimd) {
+ // x  x  0
+ // x  x  0
+ TEST(tile_padding_load_store_6, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_padding_load_store_result_validate<int>, _1, _2,
+                     _3, 16, 16, 1, 0);
+@@ -120,7 +120,7 @@ TEST(tile_padding_load_store_6, esimd) {
+ // 0  x  x
+ // 0  0  0
+ TEST(tile_padding_load_store_7, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_padding_load_store_result_validate<int>, _1, _2,
+                     _3, 16, 16, -1, 1);
+@@ -134,7 +134,7 @@ TEST(tile_padding_load_store_7, esimd) {
+ // x  x  x
+ // 0  0  0
+ TEST(tile_padding_load_store_8, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_padding_load_store_result_validate<int>, _1, _2,
+                     _3, 16, 16, 0, 1);
+@@ -148,7 +148,7 @@ TEST(tile_padding_load_store_8, esimd) {
+ // x  x  0
+ // 0  0  0
+ TEST(tile_padding_load_store_9, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_padding_load_store_result_validate<int>, _1, _2,
+                     _3, 16, 16, 1, 1);
+@@ -158,7 +158,7 @@ TEST(tile_padding_load_store_9, esimd) {
+ }
+ 
+ TEST(tile_load_store, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(tile_load_store_result_validate<int>, _1,
+             _2, _3, 128, 64, 32, 32, 0);
+     kernel_run<int, tile_load_store_func<int, 128, 64, 128, 32, 32, 16, 16>>(
+@@ -166,7 +166,7 @@ TEST(tile_load_store, esimd) {
+ }
+ 
+ TEST(tile_load_transpose_store_1, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_load_store_result_validate<int, false, true>, _1,
+                     _2, _3, 128, 64, 32, 32, 0);
+@@ -176,7 +176,7 @@ TEST(tile_load_transpose_store_1, esimd) {
+ }
+ 
+ TEST(tile_load_transpose_store_2, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_load_store_result_validate<int, false, true>, _1,
+                     _2, _3, 128, 64, 32, 32, 0);
+@@ -186,7 +186,7 @@ TEST(tile_load_transpose_store_2, esimd) {
+ }
+ 
+ TEST(tile_load_transform_store, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_load_store_result_validate<bf16, true>, _1, _2, _3,
+                     128, 64, 32, 32, 0);
+@@ -196,7 +196,7 @@ TEST(tile_load_transform_store, esimd) {
+ }
+ 
+ TEST(tile_load_store_atomic, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(tile_load_store_result_validate<float>, _1,
+             _2, _3, 128, 64, 32, 32, 0);
+     kernel_run<float,
+@@ -205,7 +205,7 @@ TEST(tile_load_store_atomic, esimd) {
+ }
+ 
+ TEST(tile_load_store_atomic_oob, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(tile_load_store_result_validate<float>, _1,
+             _2, _3, 30, 31, 32, 32, 0);
+     kernel_run<float,
+@@ -214,7 +214,7 @@ TEST(tile_load_store_atomic_oob, esimd) {
+ }
+ 
+ TEST(tile_load_store_atomic_disable_oob_check, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(tile_load_store_result_validate<float>, _1,
+             _2, _3, 128, 64, 32, 32, 0);
+     kernel_run<float,
+@@ -223,7 +223,7 @@ TEST(tile_load_store_atomic_disable_oob_check, esimd) {
+ }
+ 
+ TEST(tile_load_store_atomic_boundary, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(tile_load_store_result_validate<float>, _1,
+             _2, _3, 128, 33554440, 32, 32, 33554432);
+     kernel_run<float,
+@@ -233,7 +233,7 @@ TEST(tile_load_store_atomic_boundary, esimd) {
+ }
+ 
+ TEST(tile_load_broadcast_store, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_load_broadcase_store_result_validate<int>, _1, _2,
+                     _3, 128, 32, 32);
+@@ -243,7 +243,7 @@ TEST(tile_load_broadcast_store, esimd) {
+ }
+ 
+ TEST(tile_load_store_1d, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(tile_load_store_result_validate<int>, _1,
+             _2, _3, 128, 64, 127, 1, 0);
+     kernel_run<int, tile_load_store_1d_func<int, 128, 64, 128, 127, 1, 127, 1>>(
+@@ -251,7 +251,7 @@ TEST(tile_load_store_1d, esimd) {
+ }
+ 
+ TEST(tile_load_store_1d_boundary, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(tile_load_store_result_validate<int>, _1,
+             _2, _3, 128, 3554440, 128, 1, 3554432);
+     kernel_run<int,
+@@ -261,7 +261,7 @@ TEST(tile_load_store_1d_boundary, esimd) {
+ }
+ 
+ TEST(tile_load_store_unaligned_2d, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(tile_load_store_result_validate<int>, _1,
+             _2, _3, 127, 63, 32, 32, 0);
+     kernel_run<int,
+@@ -270,7 +270,7 @@ TEST(tile_load_store_unaligned_2d, esimd) {
+ }
+ 
+ TEST(tile_load_store_oob_1, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_load_store_result_validate<int, false, true>, _1,
+                     _2, _3, 64, 64, 32 - 1, 32 - 1, 0);
+@@ -280,7 +280,7 @@ TEST(tile_load_store_oob_1, esimd) {
+ }
+ 
+ TEST(tile_load_store_oob_2, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate
+             = std::bind(tile_load_store_result_validate<bf16, false, true>, _1,
+                     _2, _3, 64, 64, 32 - 2, 32 - 2, 0);
+diff --git a/tests/unit/tile_load_store_local/main.cpp b/tests/unit/tile_load_store_local/main.cpp
+index 06810f8..72b1786 100644
+--- a/tests/unit/tile_load_store_local/main.cpp
++++ b/tests/unit/tile_load_store_local/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(tile_load_store_vnni_local_func, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_load_store_result_validate<bf16>, _1, _2, _3, 128, 32, 32);
+     kernel_run<bf16,
+@@ -30,7 +30,7 @@ TEST(tile_load_store_vnni_local_func, esimd) {
+ }
+ 
+ TEST(tile_load_store_local, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_load_store_result_validate<int>, _1, _2, _3, 128, 32, 32);
+     kernel_run<int,
+@@ -39,7 +39,7 @@ TEST(tile_load_store_local, esimd) {
+ }
+ 
+ TEST(tile_load_store_local_with_update, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_load_store_result_validate<int>, _1, _2, _3, 128, 32, 32);
+     kernel_run<int,
+@@ -48,7 +48,7 @@ TEST(tile_load_store_local_with_update, esimd) {
+ }
+ 
+ TEST(tile_transpose_store_local, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_load_store_result_validate<int>, _1, _2, _3, 64, 32, 32);
+     kernel_run<int,
+@@ -57,7 +57,7 @@ TEST(tile_transpose_store_local, esimd) {
+ }
+ 
+ TEST(tile_transpose_store_local_bf16, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_load_store_result_validate<bf16>, _1, _2, _3, 64, 32, 32);
+     kernel_run<bf16,
+@@ -66,7 +66,7 @@ TEST(tile_transpose_store_local_bf16, esimd) {
+ }
+ 
+ TEST(tile_load_store_1d_local, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_load_store_result_validate<int>, _1, _2, _3, 128, 32, 32);
+     kernel_run<int,
+@@ -75,7 +75,7 @@ TEST(tile_load_store_1d_local, esimd) {
+ }
+ 
+ TEST(tile_load_store_1row_local, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_load_store_result_validate<int>, _1, _2, _3, 128, 32, 1);
+     kernel_run<int,
+@@ -84,7 +84,7 @@ TEST(tile_load_store_1row_local, esimd) {
+ }
+ 
+ TEST(tile_load_store_1d_local_with_update, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_load_store_result_validate<int>, _1, _2, _3, 128, 32, 32);
+     kernel_run<int,
+@@ -93,7 +93,7 @@ TEST(tile_load_store_1d_local_with_update, esimd) {
+ }
+ 
+ TEST(tile_load_store_1row_local_with_update, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_load_store_result_validate<int>, _1, _2, _3, 128, 32, 1);
+     kernel_run<int,
+diff --git a/tests/unit/tile_mma/main.cpp b/tests/unit/tile_mma/main.cpp
+index c622df5..3622ef0 100644
+--- a/tests/unit/tile_mma/main.cpp
++++ b/tests/unit/tile_mma/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(tile_mma, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(tile_mma_result_validate<bf16>, _1, _2, _3,
+             16, 32, 32, gpu::xetla::mem_layout::row_major,
+             gpu::xetla::mem_layout::row_major);
+diff --git a/tests/unit/tile_row_reduction/main.cpp b/tests/unit/tile_row_reduction/main.cpp
+index b3f117a..1ea6af1 100644
+--- a/tests/unit/tile_row_reduction/main.cpp
++++ b/tests/unit/tile_row_reduction/main.cpp
+@@ -21,7 +21,7 @@
+ using namespace std::placeholders;
+ 
+ TEST(tile_row_reduction_fp32, esimd) {
+-    cl::sycl::nd_range<1> nd_range({1}, {1});
++    sycl::nd_range<1> nd_range({1}, {1});
+     auto result_validate = std::bind(
+             tile_row_reduction_result_validate<float>, _1, _2, _3, 128, 32, 24);
+     kernel_run<float,
+diff --git a/tests/utils/common.hpp b/tests/utils/common.hpp
+index 64a5b70..14909c4 100644
+--- a/tests/utils/common.hpp
++++ b/tests/utils/common.hpp
+@@ -23,9 +23,9 @@
+ #include "buff_compare.hpp"
+ #include "common/common.hpp"
+ #include "gemm_gen.hpp"
+-#include <CL/sycl.hpp>
++#include <sycl/sycl.hpp>
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ using namespace gpu;
+ using namespace gpu::xetla;
+ 
+@@ -36,6 +36,26 @@ using namespace gpu::xetla;
+ 
+ #define random_float() (generate_real_random<double>())
+ #define random_uint8() (generate_int_random<unsigned>(0, 255))
++
++#define XETLA_ASSERT_EQ(expected, actual)                                    \
++    do {                                                                     \
++        const auto xetla_expected = (expected);                              \
++        const auto xetla_actual = (actual);                                  \
++        if (xetla_expected != xetla_actual) {                                \
++            std::cerr << "Validation failed at " << __FILE__ << ':'         \
++                      << __LINE__ << ": expected " << xetla_expected        \
++                      << ", got " << xetla_actual << std::endl;              \
++            std::exit(EXIT_FAILURE);                                         \
++        }                                                                    \
++    } while (false)
++
++#define XETLA_FAIL()                                                         \
++    do {                                                                     \
++        std::cerr << "Failure at " << __FILE__ << ':' << __LINE__           \
++                  << std::endl;                                              \
++        std::exit(EXIT_FAILURE);                                             \
++    } while (false)
++
+ template <typename data_type>
+ inline auto getTypeName() {
+     fprintf(stderr, "FAIL: Not implemented specialization\n");
+diff --git a/tests/utils/execution.hpp b/tests/utils/execution.hpp
+index 8178296..dae1a65 100644
+--- a/tests/utils/execution.hpp
++++ b/tests/utils/execution.hpp
+@@ -20,7 +20,7 @@
+ #include "profiling.hpp"
+ #include "xetla.hpp"
+ 
+-using namespace cl::sycl;
++using namespace sycl;
+ using namespace gpu;
+ using namespace gpu::xetla;
+ 
+@@ -104,7 +104,7 @@ void gemm_exec(const std::string &compile_str, size_t batch = 1) {
+                 Test::layout_b == mem_layout::col_major ? matrix_k : matrix_n,
+                 nullptr, matrix_n, nullptr, nullptr);
+ 
+-        cl::sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(arg);
++        sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(arg);
+ 
+         for (size_t i = 0; i < batch; i++) {
+             auto A_ptr = A + i * size_a;
+@@ -138,7 +138,7 @@ void gemm_exec(const std::string &compile_str, size_t batch = 1) {
+             });
+             e_esimd.wait();
+         }
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         result = test_result::fail;
+     }
+@@ -206,7 +206,7 @@ void kernel_run(auto nd_range, auto validate_result) {
+             });
+         });
+         e_esimd.wait();
+-    } catch (cl::sycl::exception const &e) {
++    } catch (sycl::exception const &e) {
+         std::cout << "SYCL exception caught: " << e.what() << '\n';
+         FAIL();
+     }
+diff --git a/tests/utils/profiling.hpp b/tests/utils/profiling.hpp
+index de76334..bcb1742 100644
+--- a/tests/utils/profiling.hpp
++++ b/tests/utils/profiling.hpp
+@@ -17,13 +17,16 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <cassert>
++#include <cmath>
+ #include <iostream>
+-#include <math.h>
+-#include <stdlib.h>
+ #include <string>
+ #include <vector>
+-#include <CL/sycl.hpp>
++#include <sycl/sycl.hpp>
++
++#ifdef XETLA_ENABLE_GTEST_REPORTING
+ #include <gtest/gtest.h>
++#endif
+ 
+ enum class profiling_selector : uint8_t { CPU = 0, GPU = 1, ALL = 2 };
+ 
+@@ -39,6 +42,16 @@ struct profiling_statistics {
+ using std::string;
+ using std::vector;
+ 
++inline void xetla_record_property(
++        const std::string &key, const std::string &value) {
++#ifdef XETLA_ENABLE_GTEST_REPORTING
++    ::testing::Test::RecordProperty(key, value);
++#else
++    (void)key;
++    (void)value;
++#endif
++}
++
+ class profiling_helper {
+     //Statistics on CPU and GPU
+     profiling_statistics gpu_statistics;
+@@ -96,7 +109,7 @@ class profiling_helper {
+ 
+         //time mean square error
+         for (int i = 1; i < iter; i++) {
+-            stat.variance += pow(time[i] - stat.mean, 2);
++            stat.variance += std::pow(time[i] - stat.mean, 2);
+         }
+         stat.variance /= iter;
+     }
+@@ -125,7 +138,7 @@ class profiling_helper {
+         string time_string = std::to_string(stat.min) + " "
+                 + std::to_string(stat.max) + " " + std::to_string(stat.median)
+                 + " " + std::to_string(stat.mean);
+-        ::testing::Test::RecordProperty(
++        xetla_record_property(
+                 "kernel_time:ms:" + this->kernel_name[kernel_id], time_string);
+     }
+ 
+@@ -146,7 +159,7 @@ class profiling_helper {
+             perf_string = perf_string + std::to_string(perf) + " ";
+         }
+ 
+-        ::testing::Test::RecordProperty("kernel_time:" + work_name[kernel_id]
++        xetla_record_property("kernel_time:" + work_name[kernel_id]
+                         + ":" + this->kernel_name[kernel_id],
+                 perf_string);
+     }
+@@ -193,7 +206,7 @@ class profiling_helper {
+ 
+     void write_performance_metrics_into_report() {
+         //Output performance data to json file
+-        ::testing::Test::RecordProperty(
++        xetla_record_property(
+                 ":kernel_time:ms", "minimum:maximum:median:mean");
+         vector<string> metrics = {"gflops", "mhashs", "GB/s"};
+         vector<bool> is_printed(metrics.size(), 0);
+@@ -202,7 +215,7 @@ class profiling_helper {
+             for (uint32_t i = 0; i < metrics.size(); i++) {
+                 if (!is_printed[i]
+                         && (this->work_name[kernel_id] == metrics[i])) {
+-                    ::testing::Test::RecordProperty(
++                    xetla_record_property(
+                             ":kernel_time:" + metrics[i],
+                             "minimum:maximum:median:mean");
+                     is_printed[i] = 1;
