@@ -18,10 +18,13 @@ SPIRVFLAGS ?= -O3 -std=c++17 -fsycl -fsycl-targets=spir64 \
 
 .PHONY: all clean level-zero
 
-all: peak_mem_2d peak_compute_dpas gemm
+all: peak_mem_2d peak_compute_dpas gemm gemv
 
 gemm: gemm.cpp gemm_kernel.hpp
 	$(CXX) $(CXXFLAGS) $(GEMM_SYCLFLAGS) $< -o $@
+
+gemv: gemv.cpp gemv_kernel.hpp
+	$(CXX) $(CXXFLAGS) $(SYCLFLAGS) $< -o $@
 
 peak_mem_2d: peak_mem_2d.cpp peak_mem_2d_kernel.cpp peak_mem_2d_kernel.hpp
 	$(CXX) $(CXXFLAGS) $(SYCLFLAGS) peak_mem_2d.cpp \
@@ -73,7 +76,7 @@ level_zero/peak_compute_dpas.spv: level_zero/peak_compute_spv_entry.cpp \
 	test $$found -eq 1
 
 clean:
-	rm -f peak_mem_2d peak_compute_dpas gemm level_zero/peak_l0 \
+	rm -f peak_mem_2d peak_compute_dpas gemm gemv level_zero/peak_l0 \
 		level_zero/peak_mem_2d.spv level_zero/peak_compute_dpas.spv \
 		level_zero/.peak_mem_spv_bundle level_zero/.peak_mem_image.* \
 		level_zero/.peak_compute_spv_bundle \

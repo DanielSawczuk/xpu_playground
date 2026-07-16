@@ -1,6 +1,6 @@
 # BMG eSIMD peak-throughput benchmarks
 
-This directory contains two BMG peak-throughput benchmarks and a GEMM:
+This directory contains two BMG peak-throughput benchmarks, GEMM, and GEMV:
 
 - `peak_mem_2d.cpp`: memory benchmark host and profiling code.
 - `peak_mem_2d_kernel.cpp`: separately compiled eSIMD free-function kernel
@@ -10,6 +10,8 @@ This directory contains two BMG peak-throughput benchmarks and a GEMM:
   kernel using XMX/DPAS, block-2D prefetch, and block-2D operand loads.
 - `gemm.cpp`: a standalone eSIMD/XMX row-major GEMM with FP32 accumulation, FP16 or BF16
   inputs/output, edge predication, and automatic padding for arbitrary sizes.
+- `gemv.cpp`: a standalone row-major matrix-vector multiply using eSIMD
+  block-2D reads, FP32 accumulation, and FP16 or BF16 inputs/output.
 
 See [`BMG_PROGRAMMING_NOTES.md`](BMG_PROGRAMMING_NOTES.md) for the collected
 implementation notes, compiler and Level Zero details, performance methodology,
@@ -50,6 +52,7 @@ Run on the Level Zero GPU backend:
 ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./peak_mem_2d
 ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./peak_compute_dpas
 ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./gemm --size 4096 --type bf16
+ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./gemv --size 16384 --type bf16
 ```
 
 The GEMM defaults to a 4096-square BF16 multiply. It accepts independent
@@ -59,12 +62,23 @@ dimensions, FP16 input/output, and configurable timing counts:
 ./gemm --m 3072 --n 4096 --k 2048 --type fp16 --iterations 20 --warmups 5
 ```
 
-The GEMM has no library dependency beyond SYCL/eSIMD. Its workgroup kernel
-uses 192-by-256 workgroup tiles, cooperative block-2D prefetches for L1 operand
-reuse, large-GRF mode, snake swizzling, and twelve independent DPAS chains in
-each 24-by-64 work-item tile; it does not stage operands through SLM.
+The GEMM has no library dependency beyond SYCL/eSIMD. Its large workgroup
+kernel uses 256-by-256 workgroup tiles, cooperative block-2D prefetches for L1
+operand reuse, large-GRF mode, snake swizzling, and sixteen independent DPAS
+chains in each 32-by-64 work-item tile; it does not stage operands through SLM.
 The GEMM build rule also passes `-doubleGRF` directly to the AOT backend;
 oneAPI 2026 does not propagate the kernel GRF property to the AOT finalizer.
+
+GEMV computes a row-major `M x K` matrix times a `K`-element column vector.
+Each eSIMD work-item streams one matrix row with 32-element block-2D reads,
+keeps the vector cached, and accumulates in FP32. Irregular device-generated
+inputs avoid lossless-memory-compression artifacts. For a large matrix its
+arithmetic intensity is approximately one FLOP per matrix byte, so GFLOP/s and
+effective matrix-read GB/s are nearly identical:
+
+```sh
+./gemv --m 16384 --k 16384 --type fp16 --iterations 50 --warmups 5
+```
 
 The memory defaults are a 1024 MiB surface, three warmups, and 100 timed
 launches. The free-function kernel is declared in `peak_mem_2d_kernel.hpp`,

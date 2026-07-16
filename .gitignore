@@ -1,6 +1,7 @@
 /peak_mem_2d
 /peak_compute_dpas
 /gemm
+/gemv
 /level_zero/peak_l0
 /level_zero/*.spv
 /level_zero/.*_spv_bundle
