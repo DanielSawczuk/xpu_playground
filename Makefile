@@ -4,6 +4,10 @@ CXXFLAGS ?= -O3 -std=c++17
 SYCLFLAGS ?= -fsycl -fsycl-targets=spir64_gen \
 	-Xsycl-target-backend=spir64_gen "-device $(DEVICE)" \
 	-fsycl-device-code-split=per_kernel
+GEMM_SYCLFLAGS ?= -fsycl -fsycl-targets=spir64_gen \
+	-Xsycl-target-backend=spir64_gen \
+	"-device $(DEVICE) -options '-doubleGRF'" \
+	-fsycl-device-code-split=per_kernel
 
 DPCPP ?= dpcpp
 HOST_CXX ?= c++
@@ -14,7 +18,10 @@ SPIRVFLAGS ?= -O3 -std=c++17 -fsycl -fsycl-targets=spir64 \
 
 .PHONY: all clean level-zero
 
-all: peak_mem_2d peak_compute_dpas
+all: peak_mem_2d peak_compute_dpas gemm
+
+gemm: gemm.cpp gemm_kernel.hpp
+	$(CXX) $(CXXFLAGS) $(GEMM_SYCLFLAGS) $< -o $@
 
 peak_mem_2d: peak_mem_2d.cpp peak_mem_2d_kernel.cpp peak_mem_2d_kernel.hpp
 	$(CXX) $(CXXFLAGS) $(SYCLFLAGS) peak_mem_2d.cpp \
@@ -66,7 +73,7 @@ level_zero/peak_compute_dpas.spv: level_zero/peak_compute_spv_entry.cpp \
 	test $$found -eq 1
 
 clean:
-	rm -f peak_mem_2d peak_compute_dpas level_zero/peak_l0 \
+	rm -f peak_mem_2d peak_compute_dpas gemm level_zero/peak_l0 \
 		level_zero/peak_mem_2d.spv level_zero/peak_compute_dpas.spv \
 		level_zero/.peak_mem_spv_bundle level_zero/.peak_mem_image.* \
 		level_zero/.peak_compute_spv_bundle \

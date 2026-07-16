@@ -53,6 +53,37 @@ the verified build command are in `patches/README.md`.
 
 ## Compiler targets
 
+### Dumping eSIMD assembly and checking GRF mode
+
+The IGC shader-dump controls also capture VC output for eSIMD kernels. For a
+JIT build, disable the runtime cache so compilation actually occurs:
+
+```sh
+icpx -O3 -std=c++17 -fsycl -fsycl-device-code-split=per_kernel \
+  gemm.cpp -o /tmp/gemm-jit
+IGC_ShaderDumpEnable=1 \
+IGC_DumpToCustomDir=/tmp/gemm-dumps \
+IGC_ShaderDumpPidDisable=1 \
+SYCL_CACHE_DISABLE=1 ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
+  /tmp/gemm-jit --m 2560 --n 2560 --k 32 --iterations 1 --warmups 1
+```
+
+For AOT, put the same `IGC_*` variables on the compiler invocation. Relevant
+outputs are `VC_*.asm`, `VC_*.visaasm`, `VC_*.zeinfo`, and
+`VC_*_options.txt`. Large-GRF mode is confirmed by all three of:
+
+```text
+options:       -doubleGRF -vc-codegen
+zeinfo:        grf_count: 256
+assembly:      .thread_config numGRF=256
+```
+
+With oneAPI 2026, the `grf_size<256>` kernel property was honored by JIT but
+did not reach the `spir64_gen` AOT finalizer. The GEMM Makefile rule therefore
+passes `-options '-doubleGRF'` explicitly. A scratch-location declaration is
+part of the standard ABI and does not by itself indicate spilling; look for
+actual scratch instructions or the finalizer's `Spill memory used` message.
+
 For an AOT SYCL executable targeting the BMG family:
 
 ```sh
