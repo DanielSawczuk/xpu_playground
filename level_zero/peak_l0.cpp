@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -208,17 +209,24 @@ public:
 
   const ze_device_properties_t &properties() const { return properties_; }
 
-  void load_kernel(const std::string &spv_path,
+  void load_kernel(const std::string &spv_path, uint32_t local_size,
                    const std::string &entry_name_fragment,
-                   const std::string &fallback_entry_name) {
+                   const std::string &fallback_entry_name,
+                   bool double_grf = false) {
     const std::vector<uint8_t> spirv = read_binary(spv_path);
 
     auto module_desc =
         make_descriptor<ze_module_desc_t>(ZE_STRUCTURE_TYPE_MODULE_DESC);
-    module_desc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    const bool native = spv_path.size() >= 4 &&
+                        spv_path.compare(spv_path.size() - 4, 4, ".bin") == 0;
+    module_desc.format = native ? ZE_MODULE_FORMAT_NATIVE
+                                : ZE_MODULE_FORMAT_IL_SPIRV;
     module_desc.inputSize = spirv.size();
     module_desc.pInputModule = spirv.data();
-    module_desc.pBuildFlags = "-vc-codegen -disable-finalizer-msg";
+    const std::string build_flags = native ? "" : double_grf
+        ? "-vc-codegen -doubleGRF -disable-finalizer-msg"
+        : "-vc-codegen -disable-finalizer-msg";
+    module_desc.pBuildFlags = build_flags.empty() ? nullptr : build_flags.c_str();
 
     ze_module_build_log_handle_t build_log = nullptr;
     const ze_result_t result = zeModuleCreate(context_, device_, &module_desc,
@@ -274,7 +282,7 @@ public:
         make_descriptor<ze_kernel_desc_t>(ZE_STRUCTURE_TYPE_KERNEL_DESC);
     kernel_desc.pKernelName = selected_name.c_str();
     ZE_CHECK(zeKernelCreate(module_, &kernel_desc, &kernel_));
-    ZE_CHECK(zeKernelSetGroupSize(kernel_, kLocalSize, 1, 1));
+    ZE_CHECK(zeKernelSetGroupSize(kernel_, local_size, 1, 1));
     kernel_name_ = std::move(selected_name);
   }
 
@@ -352,12 +360,15 @@ private:
 };
 
 struct Options {
-  enum class Mode { Memory, Compute } mode = Mode::Memory;
+  enum class Mode { Memory, Compute, Gemv, Gemm } mode = Mode::Memory;
   std::string spv_path;
   uint64_t size_mib = 1024;
   uint32_t work_items = 4096;
   uint32_t rounds = 8192;
   uint32_t iterations = 100;
+  uint32_t warmups = 3;
+  uint32_t m = 0, n = 0, k = 0;
+  bool fp16 = false;
   std::string kernel_entry;
 };
 
@@ -376,6 +387,13 @@ uint64_t parse_u64(const std::string &value, const char *option) {
   return number;
 }
 
+uint32_t parse_u32(const std::string &value, const char *option) {
+  const uint64_t number = parse_u64(value, option);
+  if (number > UINT32_MAX)
+    throw std::runtime_error(std::string(option) + " is too large");
+  return static_cast<uint32_t>(number);
+}
+
 void print_usage(const char *program) {
   std::cout
       << "Usage:\n"
@@ -383,7 +401,13 @@ void print_usage(const char *program) {
       << " mem [--spv FILE] [--kernel NAME] [--size-mib N] [--iterations N]\n"
       << "  " << program
       << " compute [--spv FILE] [--kernel NAME] [--work-items N] [--rounds N]"
-         " [--iterations N]\n";
+         " [--iterations N]\n"
+      << "  " << program
+      << " gemv [--spv FILE] [--kernel NAME] [--size N | --m M --k K]"
+         " [--type bf16|fp16] [--iterations N] [--warmups N]\n"
+      << "  " << program
+      << " gemm [--spv FILE] [--kernel NAME] [--size N | --m M --n N --k K]"
+         " [--type bf16|fp16] [--iterations N] [--warmups N]\n";
 }
 
 Options parse_options(int argc, char **argv) {
@@ -405,6 +429,16 @@ Options parse_options(int argc, char **argv) {
     options.kernel_entry =
         "_ZTSN12_GLOBAL__N_125PeakComputeLevelZeroEntryE";
     options.iterations = 1000;
+  } else if (mode == "gemv") {
+    options.mode = Options::Mode::Gemv;
+    options.m = options.k = 16384;
+    options.iterations = 50;
+    options.warmups = 5;
+  } else if (mode == "gemm") {
+    options.mode = Options::Mode::Gemm;
+    options.m = options.n = options.k = 4096;
+    options.iterations = 20;
+    options.warmups = 5;
   } else if (mode == "-h" || mode == "--help") {
     print_usage(argv[0]);
     std::exit(0);
@@ -431,6 +465,32 @@ Options parse_options(int argc, char **argv) {
       if (parsed > std::numeric_limits<uint32_t>::max())
         throw std::runtime_error("--iterations is too large");
       options.iterations = static_cast<uint32_t>(parsed);
+    } else if (option == "--warmups" &&
+               (options.mode == Options::Mode::Gemv ||
+                options.mode == Options::Mode::Gemm)) {
+      options.warmups = parse_u32(value, "--warmups");
+    } else if (option == "--type" &&
+               (options.mode == Options::Mode::Gemv ||
+                options.mode == Options::Mode::Gemm)) {
+      if (value == "fp16") options.fp16 = true;
+      else if (value == "bf16") options.fp16 = false;
+      else throw std::runtime_error("--type must be bf16 or fp16");
+    } else if (option == "--size" &&
+               (options.mode == Options::Mode::Gemv ||
+                options.mode == Options::Mode::Gemm)) {
+      const uint32_t size = parse_u32(value, "--size");
+      options.m = options.k = size;
+      if (options.mode == Options::Mode::Gemm) options.n = size;
+    } else if (option == "--m" &&
+               (options.mode == Options::Mode::Gemv ||
+                options.mode == Options::Mode::Gemm)) {
+      options.m = parse_u32(value, "--m");
+    } else if (option == "--n" && options.mode == Options::Mode::Gemm) {
+      options.n = parse_u32(value, "--n");
+    } else if (option == "--k" &&
+               (options.mode == Options::Mode::Gemv ||
+                options.mode == Options::Mode::Gemm)) {
+      options.k = parse_u32(value, "--k");
     } else if (option == "--size-mib" &&
                options.mode == Options::Mode::Memory) {
       options.size_mib = parse_u64(value, "--size-mib");
@@ -450,6 +510,25 @@ Options parse_options(int argc, char **argv) {
       throw std::runtime_error("invalid option for this mode: " + option);
     }
   }
+  if (options.mode == Options::Mode::Gemv && options.spv_path.empty()) {
+    options.spv_path = options.fp16 ? "level_zero/gemv_fp16.bin"
+                                    : "level_zero/gemv_bf16.bin";
+    if (options.kernel_entry.empty())
+      options.kernel_entry = options.fp16 ? "_ZTS22GemvFp16LevelZeroEntry"
+                                          : "_ZTS22GemvBf16LevelZeroEntry";
+  }
+  if (options.mode == Options::Mode::Gemm && options.spv_path.empty()) {
+    const bool large = options.m >= 2560 && options.n >= 2560;
+    const std::string type = options.fp16 ? "fp16" : "bf16";
+    const std::string tile = large ? "large" : "small";
+    options.spv_path = "level_zero/gemm_" + type + '_' + tile + ".bin";
+    if (options.kernel_entry.empty() && options.fp16)
+      options.kernel_entry = large ? "_ZTS27GemmFp16LargeLevelZeroEntry"
+                                   : "_ZTS27GemmFp16SmallLevelZeroEntry";
+    else if (options.kernel_entry.empty())
+      options.kernel_entry = large ? "_ZTS27GemmBf16LargeLevelZeroEntry"
+                                   : "_ZTS27GemmBf16SmallLevelZeroEntry";
+  }
   return options;
 }
 
@@ -462,7 +541,7 @@ void print_common(const LevelZeroRuntime &runtime) {
 
 int run_memory(const Options &options) {
   LevelZeroRuntime runtime;
-  runtime.load_kernel(options.spv_path, "peak_mem_2d_kernel",
+  runtime.load_kernel(options.spv_path, kLocalSize, "peak_mem_2d_kernel",
                       options.kernel_entry);
 
   const uint64_t requested_bytes = options.size_mib * 1024ULL * 1024ULL;
@@ -513,7 +592,7 @@ int run_memory(const Options &options) {
   runtime.set_argument(2, surface_height);
 
   print_common(runtime);
-  std::cout << "SPIR-V: " << options.spv_path << '\n'
+  std::cout << "Module: " << options.spv_path << '\n'
             << "Input: " << (total_bytes / (1024.0 * 1024.0)) << " MiB\n"
             << "Work-items: " << work_items << '\n'
             << "Traffic/work-item: " << kMemBytesPerWorkItem << " B\n";
@@ -565,7 +644,7 @@ int run_memory(const Options &options) {
 
 int run_compute(const Options &options) {
   LevelZeroRuntime runtime;
-  runtime.load_kernel(options.spv_path, "peak_compute_dpas_kernel",
+  runtime.load_kernel(options.spv_path, kLocalSize, "peak_compute_dpas_kernel",
                       options.kernel_entry);
 
   const uint32_t work_items =
@@ -600,7 +679,7 @@ int run_compute(const Options &options) {
       static_cast<long double>(work_items) * flops_per_work_item;
 
   print_common(runtime);
-  std::cout << "SPIR-V: " << options.spv_path << '\n'
+  std::cout << "Module: " << options.spv_path << '\n'
             << "Work-items: " << work_items << '\n'
             << "Rounds: " << options.rounds << '\n'
             << "DPAS/work-item: "
@@ -637,13 +716,249 @@ int run_compute(const Options &options) {
   return valid ? 0 : 2;
 }
 
+uint32_t round_up(uint32_t value, uint32_t multiple) {
+  const uint64_t rounded = (uint64_t{value} + multiple - 1) / multiple * multiple;
+  if (rounded > UINT32_MAX)
+    throw std::runtime_error("matrix dimension is too large");
+  return static_cast<uint32_t>(rounded);
+}
+
+uint16_t float_to_bf16(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  bits += 0x7fffU + ((bits >> 16) & 1U);
+  return static_cast<uint16_t>(bits >> 16);
+}
+
+float bf16_to_float(uint16_t value) {
+  const uint32_t bits = uint32_t{value} << 16;
+  float result;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
+}
+
+uint16_t float_to_fp16(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint32_t sign = (bits >> 16) & 0x8000U;
+  int exponent = static_cast<int>((bits >> 23) & 0xffU) - 127 + 15;
+  uint32_t mantissa = bits & 0x7fffffU;
+  if (exponent <= 0) {
+    if (exponent < -10) return static_cast<uint16_t>(sign);
+    mantissa = (mantissa | 0x800000U) >> (1 - exponent);
+    return static_cast<uint16_t>(sign | ((mantissa + 0xfffU +
+                                         ((mantissa >> 13) & 1U)) >> 13));
+  }
+  if (exponent >= 31)
+    return static_cast<uint16_t>(sign | 0x7c00U);
+  mantissa += 0xfffU + ((mantissa >> 13) & 1U);
+  if (mantissa & 0x800000U) {
+    mantissa = 0;
+    if (++exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00U);
+  }
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) |
+                               (mantissa >> 13));
+}
+
+float fp16_to_float(uint16_t value) {
+  const uint32_t sign = uint32_t{value & 0x8000U} << 16;
+  uint32_t exponent = (value >> 10) & 0x1fU;
+  uint32_t mantissa = value & 0x3ffU;
+  uint32_t bits;
+  if (exponent == 0) {
+    if (mantissa == 0) bits = sign;
+    else {
+      int shift = 0;
+      while ((mantissa & 0x400U) == 0) { mantissa <<= 1; ++shift; }
+      mantissa &= 0x3ffU;
+      bits = sign | (static_cast<uint32_t>(127 - 14 - shift) << 23) |
+             (mantissa << 13);
+    }
+  } else if (exponent == 31) {
+    bits = sign | 0x7f800000U | (mantissa << 13);
+  } else {
+    bits = sign | ((exponent + 112U) << 23) | (mantissa << 13);
+  }
+  float result;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
+}
+
+uint16_t encode16(float value, bool fp16) {
+  return fp16 ? float_to_fp16(value) : float_to_bf16(value);
+}
+
+float decode16(uint16_t value, bool fp16) {
+  return fp16 ? fp16_to_float(value) : bf16_to_float(value);
+}
+
+template <typename Generator>
+void initialize_u16(LevelZeroRuntime &runtime, uint16_t *device, uint64_t count,
+                    Generator generate) {
+  const size_t capacity = static_cast<size_t>(
+      std::min<uint64_t>(count, 16ULL * 1024ULL * 1024ULL));
+  auto *staging = static_cast<uint16_t *>(
+      runtime.allocate_host(capacity * sizeof(uint16_t)));
+  for (uint64_t offset = 0; offset < count; offset += capacity) {
+    const size_t chunk = static_cast<size_t>(
+        std::min<uint64_t>(capacity, count - offset));
+    for (size_t i = 0; i < chunk; ++i) staging[i] = generate(offset + i);
+    runtime.copy(device + offset, staging, chunk * sizeof(uint16_t));
+    runtime.synchronize();
+  }
+}
+
+int run_gemv(const Options &options) {
+  constexpr uint32_t local_size = 32, columns = 32;
+  const uint32_t m = round_up(options.m, local_size);
+  const uint32_t k = round_up(options.k, columns);
+  const uint64_t matrix_count = uint64_t{m} * k;
+  LevelZeroRuntime runtime;
+  runtime.load_kernel(options.spv_path, local_size, "Gemv",
+                      options.kernel_entry);
+  auto *matrix = static_cast<uint16_t *>(
+      runtime.allocate_device(matrix_count * sizeof(uint16_t)));
+  auto *vector = static_cast<uint16_t *>(
+      runtime.allocate_device(uint64_t{k} * sizeof(uint16_t)));
+  auto *output = static_cast<uint16_t *>(
+      runtime.allocate_device(uint64_t{m} * sizeof(uint16_t)));
+  initialize_u16(runtime, matrix, matrix_count, [&](uint64_t index) {
+    uint32_t bits = static_cast<uint32_t>(index);
+    bits ^= bits >> 16; bits *= 0x7feb352dU;
+    bits ^= bits >> 15; bits *= 0x846ca68bU; bits ^= bits >> 16;
+    return encode16(0.25f + static_cast<float>(bits & 255U) / 1024.0f,
+                    options.fp16);
+  });
+  initialize_u16(runtime, vector, k, [&](uint64_t index) {
+    const uint32_t bits = static_cast<uint32_t>(index) * 747796405U;
+    return encode16(0.5f + static_cast<float>((bits >> 16) & 127U) / 512.0f,
+                    options.fp16);
+  });
+  const uint16_t zero = 0;
+  runtime.fill(output, &zero, sizeof(zero), uint64_t{m} * sizeof(uint16_t));
+  runtime.synchronize();
+  runtime.set_argument(0, matrix); runtime.set_argument(1, vector);
+  runtime.set_argument(2, output); runtime.set_argument(3, m);
+  runtime.set_argument(4, k);
+  print_common(runtime);
+  std::cout << "Module: " << options.spv_path << '\n'
+            << "Type: " << (options.fp16 ? "FP16" : "BF16")
+            << ", shape: " << options.m << 'x' << options.k;
+  if (m != options.m || k != options.k)
+    std::cout << " (padded to " << m << 'x' << k << ')';
+  std::cout << '\n';
+  const uint32_t groups = m / local_size;
+  for (uint32_t i = 0; i < options.warmups; ++i) (void)runtime.launch(groups);
+  std::vector<double> rates, bandwidths;
+  const long double operations = 2.0L * options.m * options.k;
+  const long double bytes = 2.0L * options.m * options.k;
+  for (uint32_t i = 0; i < options.iterations; ++i) {
+    const double seconds = runtime.launch(groups);
+    rates.push_back(static_cast<double>(operations / seconds / 1.0e9L));
+    bandwidths.push_back(static_cast<double>(bytes / seconds / 1.0e9L));
+  }
+  const uint32_t checks = std::min<uint32_t>(options.m, 64);
+  auto *host = static_cast<uint16_t *>(
+      runtime.allocate_host(uint64_t{checks} * sizeof(uint16_t)));
+  runtime.copy(host, output, uint64_t{checks} * sizeof(uint16_t));
+  runtime.synchronize();
+  bool valid = true;
+  for (uint32_t row = 0; row < checks; ++row) {
+    float expected = 0;
+    for (uint32_t column = 0; column < options.k; ++column) {
+      const uint64_t index = uint64_t{row} * k + column;
+      uint32_t bits = static_cast<uint32_t>(index);
+      bits ^= bits >> 16; bits *= 0x7feb352dU;
+      bits ^= bits >> 15; bits *= 0x846ca68bU; bits ^= bits >> 16;
+      const float a = decode16(encode16(
+          0.25f + static_cast<float>(bits & 255U) / 1024.0f, options.fp16),
+          options.fp16);
+      const uint32_t vb = column * 747796405U;
+      const float b = decode16(encode16(
+          0.5f + static_cast<float>((vb >> 16) & 127U) / 512.0f,
+          options.fp16), options.fp16);
+      expected += a * b;
+    }
+    const float actual = decode16(host[row], options.fp16);
+    if (std::abs(actual - expected) > std::max(1.0f, std::abs(expected) * 0.01f))
+      valid = false;
+  }
+  std::cout << std::fixed << std::setprecision(2)
+            << "Median: " << median(rates) << " GFLOP/s, "
+            << median(bandwidths) << " GB/s\nBest:   "
+            << *std::max_element(rates.begin(), rates.end()) << " GFLOP/s, "
+            << *std::max_element(bandwidths.begin(), bandwidths.end())
+            << " GB/s\nVerification: " << (valid ? "PASS" : "FAIL") << '\n';
+  return valid ? 0 : 2;
+}
+
+int run_gemm(const Options &options) {
+  constexpr uint32_t local_size = 32, tile_n = 256, prefetch_k = 32;
+  const bool large = options.m >= 2560 && options.n >= 2560;
+  const uint32_t tile_m = large ? 256 : 128;
+  const uint32_t m = round_up(options.m, tile_m);
+  const uint32_t n = round_up(options.n, tile_n);
+  const uint32_t k = round_up(options.k, prefetch_k);
+  const uint64_t as = uint64_t{m} * k, bs = uint64_t{k} * n;
+  const uint64_t cs = uint64_t{m} * n;
+  LevelZeroRuntime runtime;
+  runtime.load_kernel(options.spv_path, local_size, "Gemm",
+                      options.kernel_entry, true);
+  auto *a = static_cast<uint16_t *>(runtime.allocate_device(as * 2));
+  auto *b = static_cast<uint16_t *>(runtime.allocate_device(bs * 2));
+  auto *c = static_cast<uint16_t *>(runtime.allocate_device(cs * 2));
+  initialize_u16(runtime, a, as, [&](uint64_t index) {
+    return encode16(index / k < options.m && index % k < options.k ? 0.5f : 0,
+                    options.fp16);
+  });
+  initialize_u16(runtime, b, bs, [&](uint64_t index) {
+    return encode16(index / n < options.k && index % n < options.n ? 0.25f : 0,
+                    options.fp16);
+  });
+  const uint16_t zero = 0;
+  runtime.fill(c, &zero, sizeof(zero), cs * 2); runtime.synchronize();
+  runtime.set_argument(0, a); runtime.set_argument(1, b);
+  runtime.set_argument(2, c); runtime.set_argument(3, m);
+  runtime.set_argument(4, n); runtime.set_argument(5, k);
+  print_common(runtime);
+  std::cout << "Module: " << options.spv_path << '\n'
+            << "Type: " << (options.fp16 ? "FP16" : "BF16")
+            << ", shape: " << options.m << 'x' << options.n << 'x' << options.k;
+  if (m != options.m || n != options.n || k != options.k)
+    std::cout << " (padded to " << m << 'x' << n << 'x' << k << ')';
+  std::cout << '\n';
+  const uint32_t groups = (m / tile_m) * (n / tile_n);
+  for (uint32_t i = 0; i < options.warmups; ++i) (void)runtime.launch(groups);
+  std::vector<double> rates;
+  const long double flops = 2.0L * options.m * options.n * options.k;
+  for (uint32_t i = 0; i < options.iterations; ++i)
+    rates.push_back(static_cast<double>(flops / runtime.launch(groups) / 1.0e12L));
+  const uint32_t checks = std::min<uint32_t>(options.n, 64);
+  auto *host = static_cast<uint16_t *>(runtime.allocate_host(checks * 2));
+  runtime.copy(host, c, checks * 2); runtime.synchronize();
+  const float expected = options.k * 0.125f;
+  const float tolerance = std::max(0.5f, expected * 0.01f);
+  bool valid = true;
+  for (uint32_t i = 0; i < checks; ++i)
+    valid &= std::abs(decode16(host[i], options.fp16) - expected) <= tolerance;
+  std::cout << std::fixed << std::setprecision(2)
+            << "Median: " << median(rates) << " TFLOP/s\nBest:   "
+            << *std::max_element(rates.begin(), rates.end())
+            << " TFLOP/s\nVerification: " << (valid ? "PASS" : "FAIL") << '\n';
+  return valid ? 0 : 2;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   try {
     const Options options = parse_options(argc, argv);
-    return options.mode == Options::Mode::Memory ? run_memory(options)
-                                                  : run_compute(options);
+    switch (options.mode) {
+    case Options::Mode::Memory: return run_memory(options);
+    case Options::Mode::Compute: return run_compute(options);
+    case Options::Mode::Gemv: return run_gemv(options);
+    case Options::Mode::Gemm: return run_gemm(options);
+    }
   } catch (const std::exception &error) {
     std::cerr << "Error: " << error.what() << '\n';
     return 1;

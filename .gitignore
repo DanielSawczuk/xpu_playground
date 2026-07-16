@@ -1,8 +1,10 @@
 /peak_mem_2d
 /peak_compute_dpas
+/peak_sycl
 /gemm
 /gemv
 /level_zero/peak_l0
 /level_zero/*.spv
+/level_zero/*.bin
 /level_zero/.*_spv_bundle
 /level_zero/.*_image.*

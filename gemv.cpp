@@ -154,7 +154,7 @@ template <typename T> int run(const Options &o, sycl::queue &queue) {
 
 } // namespace
 
-int main(int argc, char **argv) {
+extern "C" int run_gemv(int argc, char **argv) {
   try {
     const Options options = parse(argc, argv);
     sycl::queue queue(sycl::gpu_selector_v,
@@ -168,3 +168,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 }
+
+#ifdef XPU_PLAYGROUND_STANDALONE_HOST
+int main(int argc, char **argv) { return run_gemv(argc, argv); }
+#endif

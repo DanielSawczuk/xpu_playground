@@ -3,6 +3,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/ext/oneapi/free_function_queries.hpp>
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
@@ -29,7 +30,8 @@ template <typename T> struct Kernel {
         sycl::ext::intel::experimental::grf_size<128>};
   }
 
-  SYCL_ESIMD_KERNEL void operator()(sycl::nd_item<1> item) const {
+  SYCL_ESIMD_FUNCTION void run() const {
+    const auto item = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
     const std::uint32_t row0 = item.get_global_linear_id() * kRows;
     const std::uint32_t width = k * sizeof(T);
     constexpr esimd::properties matrix_props{
@@ -56,6 +58,8 @@ template <typename T> struct Kernel {
     result[0] = esimd::reduce<float>(sums0, std::plus<>());
     esimd::block_store(output + row0, esimd::convert<T>(result));
   }
+
+  SYCL_ESIMD_KERNEL void operator()(sycl::nd_item<1>) const { run(); }
 };
 
 } // namespace gemv

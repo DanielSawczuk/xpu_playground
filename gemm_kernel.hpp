@@ -3,6 +3,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/ext/oneapi/free_function_queries.hpp>
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
@@ -71,7 +72,8 @@ template <typename T, bool LargeTile> struct Kernel {
     }
   }
 
-  SYCL_ESIMD_KERNEL void operator()(sycl::nd_item<1> item) const {
+  SYCL_ESIMD_FUNCTION void run() const {
+    const auto item = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
     const std::uint32_t lid = item.get_local_linear_id();
     const std::uint32_t group = item.get_group_linear_id();
     const std::uint32_t groups_n = n / kTileN;
@@ -136,6 +138,8 @@ template <typename T, bool LargeTile> struct Kernel {
       store_panel(c30, out_y + 24, out_x); store_panel(c31, out_y + 24, out_x + 16); store_panel(c32, out_y + 24, out_x + 32); store_panel(c33, out_y + 24, out_x + 48);
     }
   }
+
+  SYCL_ESIMD_KERNEL void operator()(sycl::nd_item<1>) const { run(); }
 };
 
 } // namespace gemm

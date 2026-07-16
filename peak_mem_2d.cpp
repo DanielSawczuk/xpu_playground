@@ -121,7 +121,7 @@ double event_seconds(const sycl::event &event) {
 
 } // namespace
 
-int main(int argc, char **argv) {
+extern "C" int run_peak_mem_2d(int argc, char **argv) {
   try {
     const Options options = parse_options(argc, argv);
     if (options.size_mib >
@@ -242,3 +242,7 @@ int main(int argc, char **argv) {
   }
   return 1;
 }
+
+#ifdef XPU_PLAYGROUND_STANDALONE_HOST
+int main(int argc, char **argv) { return run_peak_mem_2d(argc, argv); }
+#endif

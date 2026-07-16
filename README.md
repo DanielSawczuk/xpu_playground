@@ -49,6 +49,10 @@ make DEVICE=bmg-g31
 Run on the Level Zero GPU backend:
 
 ```sh
+ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./peak_sycl mem
+ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./peak_sycl compute
+ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./peak_sycl gemv --size 16384 --type bf16
+ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./peak_sycl gemm --size 4096 --type bf16
 ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./peak_mem_2d
 ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./peak_compute_dpas
 ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./gemm --size 4096 --type bf16
@@ -111,7 +115,7 @@ It reports throughput relative to the supplied B70 peak of 183.0 TFLOP/s.
 
 ## Level Zero host path
 
-The same free-function kernels can be compiled to standalone SPIR-V and
+All four kernels can also be compiled to standalone device modules and
 launched by a host executable that uses only the Level Zero API (no SYCL host
 runtime):
 
@@ -119,15 +123,29 @@ runtime):
 make level-zero
 ./level_zero/peak_l0 mem
 ./level_zero/peak_l0 compute
+./level_zero/peak_l0 gemv --size 16384 --type bf16
+./level_zero/peak_l0 gemm --size 4096 --type bf16
 ```
 
+The unified runners have matching `mem`, `compute`, `gemv`, and `gemm`
+subcommands: `peak_sycl` uses the SYCL host API, while
+`level_zero/peak_l0` uses only Level Zero. The original four SYCL executables
+remain as compatibility entry points and accept the same options as their
+subcommands. The SYCL dispatcher keeps the kernels in separately compiled AOT
+images so GEMM can use `-doubleGRF` without forcing that performance-sensitive
+setting onto GEMV and the peak kernels.
+
 `make level-zero` runs the complete DPC++ device pipeline, including eSIMD
-post-link lowering, and extracts the dispatchable SPIR-V image from the
-temporary compiler bundle. The small files `peak_mem_spv_entry.cpp` and
+post-link lowering, and extracts dispatchable images from the temporary
+compiler bundles. The small files `peak_mem_spv_entry.cpp` and
 `peak_compute_spv_entry.cpp` instantiate Level Zero dispatch entries that call
 the same separately maintained free-function kernels.
 
-The Level Zero runner discovers the compiler-generated entry name, passes
+The peaks use SPIR-V modules. GEMV emits native FP16 and BF16 modules, while
+GEMM additionally emits native small- and large-tile variants with the
+required `-doubleGRF` finalizer option. The runner selects the same tile at the
+2560-by-2560 threshold as the SYCL host. The Level Zero runner discovers the
+compiler-generated entry name, passes
 `-vc-codegen -disable-finalizer-msg` when creating each eSIMD module, uses
 device allocations, and measures kernel time with Level Zero kernel timestamp
 events. Its options mirror the SYCL paths:
@@ -137,7 +155,7 @@ events. Its options mirror the SYCL paths:
 ./level_zero/peak_l0 compute --work-items 4096 --rounds 8192 --iterations 1000
 ```
 
-Use `--spv FILE` with either mode to load a module from another path. The
+Use `--spv FILE` with any mode to load a module from another path. The
 runner asks Level Zero for the module's kernel names and falls back to the
 known DPC++ dispatch-wrapper name because some drivers return an empty
 kernel-name list for SPIR-V IL. `--kernel NAME` overrides that fallback when

@@ -15,28 +15,40 @@ DPCPP_BIN_DIR := $(dir $(shell command -v $(DPCPP)))
 OFFLOAD_EXTRACT ?= $(DPCPP_BIN_DIR)compiler/clang-offload-extract
 SPIRVFLAGS ?= -O3 -std=c++17 -fsycl -fsycl-targets=spir64 \
 	-fsycl-device-code-split=per_kernel
+AOTFLAGS ?= $(CXXFLAGS) $(SYCLFLAGS)
+GEMM_AOTFLAGS ?= $(CXXFLAGS) $(GEMM_SYCLFLAGS)
 
 .PHONY: all clean level-zero
 
-all: peak_mem_2d peak_compute_dpas gemm gemv
+all: peak_sycl peak_mem_2d peak_compute_dpas gemm gemv
+
+peak_sycl: peak_sycl.cpp peak_mem_2d peak_compute_dpas gemv gemm
+	$(HOST_CXX) $(CXXFLAGS) peak_sycl.cpp -o $@
 
 gemm: gemm.cpp gemm_kernel.hpp
-	$(CXX) $(CXXFLAGS) $(GEMM_SYCLFLAGS) $< -o $@
+	$(CXX) $(CXXFLAGS) -DXPU_PLAYGROUND_STANDALONE_HOST \
+		$(GEMM_SYCLFLAGS) $< -o $@
 
 gemv: gemv.cpp gemv_kernel.hpp
-	$(CXX) $(CXXFLAGS) $(SYCLFLAGS) $< -o $@
+	$(CXX) $(CXXFLAGS) -DXPU_PLAYGROUND_STANDALONE_HOST $(SYCLFLAGS) $< -o $@
 
 peak_mem_2d: peak_mem_2d.cpp peak_mem_2d_kernel.cpp peak_mem_2d_kernel.hpp
-	$(CXX) $(CXXFLAGS) $(SYCLFLAGS) peak_mem_2d.cpp \
+	$(CXX) $(CXXFLAGS) -DXPU_PLAYGROUND_STANDALONE_HOST $(SYCLFLAGS) \
+		peak_mem_2d.cpp \
 		peak_mem_2d_kernel.cpp -o $@
 
 peak_compute_dpas: peak_compute_dpas.cpp peak_compute_dpas_kernel.cpp \
 	peak_compute_dpas_kernel.hpp
-	$(CXX) $(CXXFLAGS) $(SYCLFLAGS) peak_compute_dpas.cpp \
+	$(CXX) $(CXXFLAGS) -DXPU_PLAYGROUND_STANDALONE_HOST $(SYCLFLAGS) \
+		peak_compute_dpas.cpp \
 		peak_compute_dpas_kernel.cpp -o $@
 
+GEM_MODULES := level_zero/gemv_bf16.bin level_zero/gemv_fp16.bin \
+	level_zero/gemm_bf16_small.bin level_zero/gemm_bf16_large.bin \
+	level_zero/gemm_fp16_small.bin level_zero/gemm_fp16_large.bin
+
 level-zero: level_zero/peak_l0 level_zero/peak_mem_2d.spv \
-	level_zero/peak_compute_dpas.spv
+	level_zero/peak_compute_dpas.spv $(GEM_MODULES)
 
 level_zero/peak_l0: level_zero/peak_l0.cpp
 	$(HOST_CXX) -O3 -std=c++17 $< -lze_loader -o $@
@@ -75,9 +87,27 @@ level_zero/peak_compute_dpas.spv: level_zero/peak_compute_spv_entry.cpp \
 		level_zero/.peak_compute_image.*; \
 	test $$found -eq 1
 
+define make_gem_module
+level_zero/$(1).bin: level_zero/gem_spv_entry.cpp gemv_kernel.hpp gemm_kernel.hpp
+	$$(DPCPP) $$($(3)) -D$(2) level_zero/gem_spv_entry.cpp \
+		-o level_zero/.$(1)_bundle
+	cd level_zero && $$(OFFLOAD_EXTRACT) -q --stem=.$(1)_image \
+		.$(1)_bundle
+	mv level_zero/.$(1)_image.0 $$@
+	rm -f level_zero/.$(1)_bundle level_zero/.$(1)_image.*
+endef
+
+$(eval $(call make_gem_module,gemv_bf16,GEMV_BF16,AOTFLAGS))
+$(eval $(call make_gem_module,gemv_fp16,GEMV_FP16,AOTFLAGS))
+$(eval $(call make_gem_module,gemm_bf16_small,GEMM_BF16_SMALL,GEMM_AOTFLAGS))
+$(eval $(call make_gem_module,gemm_bf16_large,GEMM_BF16_LARGE,GEMM_AOTFLAGS))
+$(eval $(call make_gem_module,gemm_fp16_small,GEMM_FP16_SMALL,GEMM_AOTFLAGS))
+$(eval $(call make_gem_module,gemm_fp16_large,GEMM_FP16_LARGE,GEMM_AOTFLAGS))
+
 clean:
-	rm -f peak_mem_2d peak_compute_dpas gemm gemv level_zero/peak_l0 \
+	rm -f peak_sycl peak_mem_2d peak_compute_dpas gemm gemv level_zero/peak_l0 \
 		level_zero/peak_mem_2d.spv level_zero/peak_compute_dpas.spv \
+		$(GEM_MODULES) level_zero/.*_bundle level_zero/.*_image.* \
 		level_zero/.peak_mem_spv_bundle level_zero/.peak_mem_image.* \
 		level_zero/.peak_compute_spv_bundle \
 		level_zero/.peak_compute_image.*

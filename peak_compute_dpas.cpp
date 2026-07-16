@@ -99,7 +99,7 @@ double event_seconds(const sycl::event &event) {
 
 } // namespace
 
-int main(int argc, char **argv) {
+extern "C" int run_peak_compute_dpas(int argc, char **argv) {
   try {
     const Options options = parse_options(argc, argv);
     auto async_handler = [](sycl::exception_list exceptions) {
@@ -220,3 +220,7 @@ int main(int argc, char **argv) {
   }
   return 1;
 }
+
+#ifdef XPU_PLAYGROUND_STANDALONE_HOST
+int main(int argc, char **argv) { return run_peak_compute_dpas(argc, argv); }
+#endif
