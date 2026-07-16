@@ -22,8 +22,8 @@ inline constexpr std::uint32_t kDpasN = 16;
 inline constexpr std::uint32_t kDpasK = 16;
 
 template <typename T, bool LargeTile> struct Kernel {
-  static constexpr std::uint32_t tile_m = LargeTile ? 192 : 128;
-  static constexpr std::uint32_t register_rows = LargeTile ? 24 : 16;
+  static constexpr std::uint32_t tile_m = LargeTile ? 256 : 128;
+  static constexpr std::uint32_t register_rows = LargeTile ? 32 : 16;
   const T *a;
   const T *b;
   T *c;
@@ -59,7 +59,7 @@ template <typename T, bool LargeTile> struct Kernel {
         esimd::cache_hint_L2<esimd::cache_hint::cached>};
     const std::uint32_t a_width = k * sizeof(T);
     const std::uint32_t b_width = n * sizeof(T);
-    if (lid < (LargeTile ? 24u : 16u))
+    if (lid < (LargeTile ? 32u : 16u))
       esimd::prefetch_2d<T, kPrefetchK, kDpasM>(
           a, a_width - 1, m - 1, a_width - 1, k0,
           tile_m + lid * kDpasM, props);
@@ -82,8 +82,8 @@ template <typename T, bool LargeTile> struct Kernel {
     const std::uint32_t tile_m = group_m * Kernel::tile_m;
     const std::uint32_t tile_n = group_n * kTileN;
 
-    // Large work-items use the fastest no-spill point found on BMG: 24x64.
-    // Smaller matrices use 16x64 with 128 GRFs for higher occupancy.
+    // Large work-items cover 32x64, producing an aligned 256x256 WG tile.
+    // Smaller matrices retain the 16x64 tile to expose more workgroups.
     const std::uint32_t out_y = tile_m + (lid & 7) * register_rows;
     const std::uint32_t out_x = tile_n + (lid >> 3) * 64;
     const std::uint32_t a_width = k * sizeof(T);
@@ -95,6 +95,7 @@ template <typename T, bool LargeTile> struct Kernel {
     esimd::simd<float, 128> c00(0), c01(0), c02(0), c03(0);
     esimd::simd<float, 128> c10(0), c11(0), c12(0), c13(0);
     esimd::simd<float, 128> c20(0), c21(0), c22(0), c23(0);
+    esimd::simd<float, 128> c30(0), c31(0), c32(0), c33(0);
 
 #pragma unroll
     for (std::uint32_t distance = 0; distance < kPrefetchDistance; ++distance)
@@ -109,24 +110,30 @@ template <typename T, bool LargeTile> struct Kernel {
       auto a0 = esimd::load_2d<T, 16, 8>(a, a_width - 1, m - 1, a_width - 1, k0, out_y, load_props);
       auto a1 = esimd::load_2d<T, 16, 8>(a, a_width - 1, m - 1, a_width - 1, k0, out_y + 8, load_props);
       auto a2 = esimd::load_2d<T, 16, 8>(a, a_width - 1, m - 1, a_width - 1, k0, out_y + 16, load_props);
+      auto a3 = esimd::load_2d<T, 16, 8>(a, a_width - 1, m - 1, a_width - 1, k0, out_y + 24, load_props);
       auto bv = esimd::load_2d<T, 16, 16, 1, false, true>(b, b_width - 1, k - 1, b_width - 1, out_x, k0, load_props);
       c00 = xmx::dpas<8, 8, float>(c00, bv, a0); c10 = xmx::dpas<8, 8, float>(c10, bv, a1);
       if constexpr (LargeTile) c20 = xmx::dpas<8, 8, float>(c20, bv, a2);
+      if constexpr (LargeTile) c30 = xmx::dpas<8, 8, float>(c30, bv, a3);
       bv = esimd::load_2d<T, 16, 16, 1, false, true>(b, b_width - 1, k - 1, b_width - 1, out_x + 16, k0, load_props);
       c01 = xmx::dpas<8, 8, float>(c01, bv, a0); c11 = xmx::dpas<8, 8, float>(c11, bv, a1);
       if constexpr (LargeTile) c21 = xmx::dpas<8, 8, float>(c21, bv, a2);
+      if constexpr (LargeTile) c31 = xmx::dpas<8, 8, float>(c31, bv, a3);
       bv = esimd::load_2d<T, 16, 16, 1, false, true>(b, b_width - 1, k - 1, b_width - 1, out_x + 32, k0, load_props);
       c02 = xmx::dpas<8, 8, float>(c02, bv, a0); c12 = xmx::dpas<8, 8, float>(c12, bv, a1);
       if constexpr (LargeTile) c22 = xmx::dpas<8, 8, float>(c22, bv, a2);
+      if constexpr (LargeTile) c32 = xmx::dpas<8, 8, float>(c32, bv, a3);
       bv = esimd::load_2d<T, 16, 16, 1, false, true>(b, b_width - 1, k - 1, b_width - 1, out_x + 48, k0, load_props);
       c03 = xmx::dpas<8, 8, float>(c03, bv, a0); c13 = xmx::dpas<8, 8, float>(c13, bv, a1);
       if constexpr (LargeTile) c23 = xmx::dpas<8, 8, float>(c23, bv, a2);
+      if constexpr (LargeTile) c33 = xmx::dpas<8, 8, float>(c33, bv, a3);
     }
 
     store_panel(c00, out_y, out_x); store_panel(c01, out_y, out_x + 16); store_panel(c02, out_y, out_x + 32); store_panel(c03, out_y, out_x + 48);
     store_panel(c10, out_y + 8, out_x); store_panel(c11, out_y + 8, out_x + 16); store_panel(c12, out_y + 8, out_x + 32); store_panel(c13, out_y + 8, out_x + 48);
     if constexpr (LargeTile) {
       store_panel(c20, out_y + 16, out_x); store_panel(c21, out_y + 16, out_x + 16); store_panel(c22, out_y + 16, out_x + 32); store_panel(c23, out_y + 16, out_x + 48);
+      store_panel(c30, out_y + 24, out_x); store_panel(c31, out_y + 24, out_x + 16); store_panel(c32, out_y + 24, out_x + 32); store_panel(c33, out_y + 24, out_x + 48);
     }
   }
 };
