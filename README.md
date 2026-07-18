@@ -184,3 +184,73 @@ runner asks Level Zero for the module's kernel names and falls back to the
 known DPC++ dispatch-wrapper name because some drivers return an empty
 kernel-name list for SPIR-V IL. `--kernel NAME` overrides that fallback when
 loading a module built from a different declaration.
+
+## Qwen3-8B greedy inference
+
+The `qwen3/` subsystem runs batch-one BF16
+[Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B/tree/main) inference on an
+Intel BMG/B70 GPU. The host executable uses only C++17 and Level Zero; all
+neural-network work is dispatched to the AOT eSIMD module. Activations and the
+40,960-position grouped-query KV cache are BF16, while GEMV accumulation,
+normalization statistics, attention/softmax, and reductions are FP32. Prompt
+tokens deliberately reuse the cached single-token decode path.
+
+Build the native engine and its BMG kernel image with oneAPI 2026:
+
+```sh
+make qwen3
+make qwen3-test
+make qwen3-gpu-test  # checkpoint-independent, requires a BMG GPU
+```
+
+The supported checkpoint is pinned to revision
+`b968826d9c46dd6066d109eabc6255188de91218`. Downloading is explicit—the
+engine and chat wrapper never access the network:
+
+```sh
+python3 -m pip install 'huggingface_hub[cli]'
+huggingface-cli download Qwen/Qwen3-8B \
+  --revision b968826d9c46dd6066d109eabc6255188de91218 \
+  --local-dir /models/Qwen3-8B
+```
+
+Run the Level Zero engine on already-tokenized input. It writes only JSON to
+stdout and diagnostics to stderr:
+
+```sh
+printf '151644 872 198' | ./qwen3_l0 \
+  --model-dir /models/Qwen3-8B --input-ids - \
+  --max-new-tokens 32 --max-seq-len 40960
+```
+
+For text chat, install the pinned reference/tokenizer dependencies and use the
+Python wrapper. It applies the checkpoint's official Hugging Face chat
+template and defaults to no-thinking greedy generation:
+
+```sh
+python3 -m pip install -r qwen3/requirements.txt
+python3 qwen3/chat.py --model-dir /models/Qwen3-8B \
+  --prompt 'Explain why the sky is blue in one sentence.' \
+  --max-new-tokens 64 --no-thinking
+```
+
+`--thinking` enables the template's thinking mode, but decoding remains
+greedy. The current milestone is single-turn and batch-one; sampling,
+quantization, batching, parallel prefill, speculative decoding, and persisted
+multi-turn caches are not implemented.
+
+The engine validates the exact 36-layer architecture, all tensor names,
+shapes, BF16 dtypes, shard bounds, input IDs, context length, BMG target, and
+reported device memory before inference. It streams each tensor directly into
+an aligned device arena, rather than retaining a checkpoint-sized host copy.
+The full cache needs roughly 5.6 GiB in addition to the approximately 16 GiB
+checkpoint and working memory.
+
+Checkpoint-dependent conformance can use `qwen3/reference.py`, which pins
+Transformers 4.51.0, eager attention, and BF16 weights. Set `MODEL_DIR` to the
+pinned checkpoint when running local all-layer or generated-token comparisons;
+the default `make qwen3-test` suite is synthetic and checkpoint-independent.
+
+```sh
+MODEL_DIR=/models/Qwen3-8B make qwen3-conformance
+```

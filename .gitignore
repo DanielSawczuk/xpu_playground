@@ -8,3 +8,8 @@
 /level_zero/*.bin
 /level_zero/.*_spv_bundle
 /level_zero/.*_image.*
+/qwen3_l0
+/qwen3_kernels.bin
+/qwen3/tests/test_cpu_reference
+/qwen3/tests/test_gpu_dispatch
+__pycache__/

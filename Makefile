@@ -21,7 +21,8 @@ ONEDNN_ROOT ?= /opt/intel/oneapi/dnnl/latest
 ONEDNN_FLAGS ?= -I$(ONEDNN_ROOT)/include -L$(ONEDNN_ROOT)/lib \
 	-Wl,--disable-new-dtags,-rpath,$(ONEDNN_ROOT)/lib -ldnnl
 
-.PHONY: all clean level-zero onednn
+.PHONY: all clean level-zero onednn qwen3 qwen3-kernels qwen3-test \
+	qwen3-gpu-test qwen3-conformance
 
 all: peak_sycl peak_mem_2d peak_compute_dpas gemm gemv
 
@@ -60,6 +61,48 @@ GEM_MODULES := level_zero/gemv_bf16.bin level_zero/gemv_fp16.bin \
 
 level-zero: level_zero/peak_l0 level_zero/peak_mem_2d.spv \
 	level_zero/peak_compute_dpas.spv $(GEM_MODULES)
+
+qwen3: qwen3_l0 qwen3_kernels.bin
+
+qwen3-kernels: qwen3_kernels.bin
+
+qwen3_l0: qwen3/main.cpp qwen3/model.cpp qwen3/model.hpp \
+	qwen3/level_zero_runtime.cpp qwen3/level_zero_runtime.hpp
+	$(HOST_CXX) -O3 -std=c++17 qwen3/main.cpp qwen3/model.cpp \
+		qwen3/level_zero_runtime.cpp -lze_loader -o $@
+
+qwen3_kernels.bin: qwen3/kernels_entry.cpp qwen3/kernels.hpp gemv_kernel.hpp
+	$(DPCPP) -O3 -std=c++17 -fsycl -fsycl-targets=spir64_gen \
+		-Xsycl-target-backend=spir64_gen "-device $(DEVICE)" \
+		-fsycl-device-code-split=off qwen3/kernels_entry.cpp \
+		-o qwen3/.qwen3_kernel_bundle
+	$(OFFLOAD_EXTRACT) -q --stem=qwen3/.qwen3_kernel_image \
+		qwen3/.qwen3_kernel_bundle
+	mv qwen3/.qwen3_kernel_image.0 $@
+	rm -f qwen3/.qwen3_kernel_bundle qwen3/.qwen3_kernel_image.*
+
+qwen3/tests/test_cpu_reference: qwen3/tests/test_cpu_reference.cpp \
+	qwen3/model.cpp qwen3/model.hpp
+	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra -Werror \
+		qwen3/tests/test_cpu_reference.cpp qwen3/model.cpp -o $@
+
+qwen3-test: qwen3/tests/test_cpu_reference
+	./qwen3/tests/test_cpu_reference
+	python3 -m py_compile qwen3/chat.py qwen3/reference.py \
+		qwen3/tests/test_conformance.py
+
+qwen3/tests/test_gpu_dispatch: qwen3/tests/test_gpu_dispatch.cpp \
+	qwen3/model.cpp qwen3/model.hpp qwen3/level_zero_runtime.cpp \
+	qwen3/level_zero_runtime.hpp
+	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra -Werror \
+		qwen3/tests/test_gpu_dispatch.cpp qwen3/model.cpp \
+		qwen3/level_zero_runtime.cpp -lze_loader -o $@
+
+qwen3-gpu-test: qwen3_kernels.bin qwen3/tests/test_gpu_dispatch
+	./qwen3/tests/test_gpu_dispatch ./qwen3_kernels.bin
+
+qwen3-conformance: qwen3
+	python3 -m unittest qwen3.tests.test_conformance
 
 level_zero/peak_l0: level_zero/peak_l0.cpp
 	$(HOST_CXX) -O3 -std=c++17 $< -lze_loader -o $@
@@ -122,4 +165,6 @@ clean:
 		$(GEM_MODULES) level_zero/.*_bundle level_zero/.*_image.* \
 		level_zero/.peak_mem_spv_bundle level_zero/.peak_mem_image.* \
 		level_zero/.peak_compute_spv_bundle \
-		level_zero/.peak_compute_image.*
+		level_zero/.peak_compute_image.* qwen3_l0 qwen3_kernels.bin \
+		qwen3/.qwen3_kernel_bundle qwen3/.qwen3_kernel_image.* \
+		qwen3/tests/test_cpu_reference qwen3/tests/test_gpu_dispatch
