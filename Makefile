@@ -17,10 +17,21 @@ SPIRVFLAGS ?= -O3 -std=c++17 -fsycl -fsycl-targets=spir64 \
 	-fsycl-device-code-split=per_kernel
 AOTFLAGS ?= $(CXXFLAGS) $(SYCLFLAGS)
 GEMM_AOTFLAGS ?= $(CXXFLAGS) $(GEMM_SYCLFLAGS)
+ONEDNN_ROOT ?= /opt/intel/oneapi/dnnl/latest
+ONEDNN_FLAGS ?= -I$(ONEDNN_ROOT)/include -L$(ONEDNN_ROOT)/lib \
+	-Wl,--disable-new-dtags,-rpath,$(ONEDNN_ROOT)/lib -ldnnl
 
-.PHONY: all clean level-zero
+.PHONY: all clean level-zero onednn
 
 all: peak_sycl peak_mem_2d peak_compute_dpas gemm gemv
+
+onednn: onednn_sycl level_zero/onednn_l0
+
+onednn_sycl: onednn_sycl.cpp onednn_matmul.hpp
+	$(CXX) $(CXXFLAGS) -fsycl $< $(ONEDNN_FLAGS) -o $@
+
+level_zero/onednn_l0: level_zero/onednn_l0.cpp onednn_matmul.hpp
+	$(HOST_CXX) $(CXXFLAGS) $< $(ONEDNN_FLAGS) -lze_loader -o $@
 
 peak_sycl: peak_sycl.cpp peak_mem_2d peak_compute_dpas gemv gemm
 	$(HOST_CXX) $(CXXFLAGS) peak_sycl.cpp -o $@
@@ -106,6 +117,7 @@ $(eval $(call make_gem_module,gemm_fp16_large,GEMM_FP16_LARGE,GEMM_AOTFLAGS))
 
 clean:
 	rm -f peak_sycl peak_mem_2d peak_compute_dpas gemm gemv level_zero/peak_l0 \
+		onednn_sycl level_zero/onednn_l0 \
 		level_zero/peak_mem_2d.spv level_zero/peak_compute_dpas.spv \
 		$(GEM_MODULES) level_zero/.*_bundle level_zero/.*_image.* \
 		level_zero/.peak_mem_spv_bundle level_zero/.peak_mem_image.* \

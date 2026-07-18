@@ -59,6 +59,30 @@ ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./gemm --size 4096 --type bf16
 ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./gemv --size 16384 --type bf16
 ```
 
+## oneDNN interoperability
+
+The same oneDNN matmul primitive can be submitted from either a SYCL host or
+a pure Level Zero host. Both examples wrap the application's existing device,
+context, queue/command list, and USM allocations; oneDNN does not create a
+second GPU runtime. The runtime-independent primitive is kept in
+`onednn_matmul.hpp`, leaving only the interoperability calls in each host.
+
+Build against oneDNN 3.14 or newer (the direct Level Zero interoperability
+header was added after oneDNN 3.11):
+
+```sh
+make onednn ONEDNN_ROOT=/path/to/onednn/install
+ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./onednn_sycl 4096 100 fp16
+./level_zero/onednn_l0 4096 100 fp16
+```
+
+The optional third argument selects `f32` (the default), `bf16`, or `fp16`.
+Both hosts use the runtime-specific interoperability execution API so event
+dependencies for primitives with multiple internal kernels remain valid.
+
+The SYCL target can also be built alone with the oneAPI 2026 oneDNN 3.11
+installation: `make onednn_sycl`.
+
 The GEMM defaults to a 4096-square BF16 multiply. It accepts independent
 dimensions, FP16 input/output, and configurable timing counts:
 
